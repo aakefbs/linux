@@ -784,10 +784,17 @@ static void fuse_iqueue_init(struct fuse_iqueue *fiq,
 			     const struct fuse_iqueue_ops *ops,
 			     void *priv)
 {
+	int lt;
+
 	memset(fiq, 0, sizeof(struct fuse_iqueue));
 	spin_lock_init(&fiq->lock);
-	init_waitqueue_head(&fiq->waitq);
-	INIT_LIST_HEAD(&fiq->pending);
+
+	for (lt = 0; lt < FPT_PENDING_ANY; lt++)
+	{
+		init_waitqueue_head(&fiq->waitq[lt]);
+		INIT_LIST_HEAD(&fiq->pending[lt]);
+	}
+
 	INIT_LIST_HEAD(&fiq->interrupts);
 	fiq->forget_list_tail = &fiq->forget_list_head;
 	fiq->connected = 1;
@@ -1117,6 +1124,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 		if (arg->minor >= 6) {
 			u64 flags = arg->flags | (u64) arg->flags2 << 32;
 
+			printk("flags=%llu", flags);
+
 			ra_pages = arg->max_readahead / PAGE_SIZE;
 			if (flags & FUSE_ASYNC_READ)
 				fc->async_read = 1;
@@ -1189,6 +1198,11 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->setxattr_ext = 1;
 			if (flags & FUSE_SECURITY_CTX)
 				fc->init_security = 1;
+			if (flags & FUSE_READ_AND_SPLICE)
+			{
+				printk("enabling read-and-splice\n");
+				WRITE_ONCE(fc->no_splice_for_small_reads, 1);
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1234,7 +1248,7 @@ void fuse_send_init(struct fuse_mount *fm)
 		FUSE_ABORT_ERROR | FUSE_MAX_PAGES | FUSE_CACHE_SYMLINKS |
 		FUSE_NO_OPENDIR_SUPPORT | FUSE_EXPLICIT_INVAL_DATA |
 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
-		FUSE_SECURITY_CTX;
+		FUSE_SECURITY_CTX | FUSE_READ_AND_SPLICE;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;

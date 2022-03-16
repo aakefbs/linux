@@ -330,6 +330,12 @@ enum fuse_req_flag {
 	FR_ASYNC,
 };
 
+enum fuse_pending_type {
+	FPT_PENDING_LARGE,
+	FPT_PENDING_SMALL,
+	FPT_PENDING_ANY /* must be the last element */
+};
+
 /**
  * A request to the client
  *
@@ -390,19 +396,22 @@ struct fuse_iqueue_ops {
 	/**
 	 * Signal that a forget has been queued
 	 */
-	void (*wake_forget_and_unlock)(struct fuse_iqueue *fiq)
+	void (*wake_forget_and_unlock)(struct fuse_iqueue *fiq,
+				       enum fuse_pending_type type)
 		__releases(fiq->lock);
 
 	/**
 	 * Signal that an INTERRUPT request has been queued
 	 */
-	void (*wake_interrupt_and_unlock)(struct fuse_iqueue *fiq)
+	void (*wake_interrupt_and_unlock)(struct fuse_iqueue *fiq,
+					  enum fuse_pending_type type)
 		__releases(fiq->lock);
 
 	/**
 	 * Signal that a request has been queued
 	 */
-	void (*wake_pending_and_unlock)(struct fuse_iqueue *fiq)
+	void (*wake_pending_and_unlock)(struct fuse_iqueue *fiq,
+					enum fuse_pending_type type)
 		__releases(fiq->lock);
 
 	/**
@@ -421,14 +430,18 @@ struct fuse_iqueue {
 	/** Lock protecting accesses to members of this structure */
 	spinlock_t lock;
 
-	/** Readers of the connection are waiting on this */
-	wait_queue_head_t waitq;
+	/** Readers of the connection are waiting on this
+	 *  Multiple queues are defined for the read-for-small and
+	 *  splice-for-large IOs feature - to be able to wake up the right
+	 *  thread
+	 */
+	wait_queue_head_t waitq[FPT_PENDING_ANY];
 
 	/** The next unique request id */
 	u64 reqctr;
 
 	/** The list of pending requests */
-	struct list_head pending;
+	struct list_head pending[FPT_PENDING_ANY];
 
 	/** Pending interrupts */
 	struct list_head interrupts;
@@ -783,6 +796,9 @@ struct fuse_conn {
 
 	/* Does the filesystem support per inode DAX? */
 	unsigned int inode_dax:1;
+
+	/** small reads with read() and large with splice()? */
+	unsigned no_splice_for_small_reads;
 
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;

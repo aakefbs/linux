@@ -389,6 +389,7 @@ struct fuse_file_lock {
 /* bits 32..63 get shifted down 32 bits into the flags2 field */
 #define FUSE_SECURITY_CTX	(1ULL << 32)
 #define FUSE_HAS_INODE_DAX	(1ULL << 33)
+#define FUSE_READ_AND_SPLICE	(1ULL << 35)
 
 /**
  * CUSE INIT request/reply flags

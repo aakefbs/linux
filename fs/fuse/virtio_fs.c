@@ -969,7 +969,8 @@ static struct virtio_driver virtio_fs_driver = {
 #endif
 };
 
-static void virtio_fs_wake_forget_and_unlock(struct fuse_iqueue *fiq)
+static void virtio_fs_wake_forget_and_unlock(struct fuse_iqueue *fiq,
+					     enum fuse_pending_type type __always_unused)
 __releases(fiq->lock)
 {
 	struct fuse_forget_link *link;
@@ -1004,7 +1005,8 @@ __releases(fiq->lock)
 	kfree(link);
 }
 
-static void virtio_fs_wake_interrupt_and_unlock(struct fuse_iqueue *fiq)
+static void virtio_fs_wake_interrupt_and_unlock(struct fuse_iqueue *fiq,
+					        enum fuse_pending_type type __always_unused)
 __releases(fiq->lock)
 {
 	/*
@@ -1219,7 +1221,8 @@ out:
 	return ret;
 }
 
-static void virtio_fs_wake_pending_and_unlock(struct fuse_iqueue *fiq)
+static void virtio_fs_wake_pending_and_unlock(struct fuse_iqueue *fiq,
+					      enum fuse_pending_type type)
 __releases(fiq->lock)
 {
 	unsigned int queue_id = VQ_REQUEST; /* TODO multiqueue */
@@ -1228,11 +1231,11 @@ __releases(fiq->lock)
 	struct virtio_fs_vq *fsvq;
 	int ret;
 
-	WARN_ON(list_empty(&fiq->pending));
-	req = list_last_entry(&fiq->pending, struct fuse_req, list);
+	WARN_ON(list_empty(&fiq->pending[type]));
+	req = list_last_entry(&fiq->pending[type], struct fuse_req, list);
 	clear_bit(FR_PENDING, &req->flags);
 	list_del_init(&req->list);
-	WARN_ON(!list_empty(&fiq->pending));
+	WARN_ON(!list_empty(&fiq->pending[type]));
 	spin_unlock(&fiq->lock);
 
 	fs = fiq->priv;

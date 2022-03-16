@@ -29,6 +29,13 @@ MODULE_ALIAS("devname:fuse");
 #define FUSE_INT_REQ_BIT (1ULL << 0)
 #define FUSE_REQ_ID_STEP (1ULL << 1)
 
+/*
+ * Sending small requests via splice/pipe is expensive. If supported, user
+ * space should use read() for small and splice for large requests
+ * Make it configurable?
+ */
+#define FUSE_REQ_SMALL_QUEUE_SIZE (16384)
+
 static struct kmem_cache *fuse_req_cachep;
 
 static struct fuse_dev *fuse_get_dev(struct file *file)
@@ -207,10 +214,13 @@ static unsigned int fuse_req_hash(u64 unique)
 /**
  * A new request is available, wake fiq->waitq
  */
-static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq)
+static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq,
+		enum fuse_pending_type pending_type)
 __releases(fiq->lock)
 {
-	wake_up(&fiq->waitq);
+	// printk("waking up type %d\n", pending_type);
+
+	wake_up(&fiq->waitq[pending_type]);
 	kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
 	spin_unlock(&fiq->lock);
 }
@@ -226,17 +236,31 @@ static void queue_request_and_unlock(struct fuse_iqueue *fiq,
 				     struct fuse_req *req)
 __releases(fiq->lock)
 {
+	struct fuse_conn *fc = req->fm->fc;
+	struct list_head *list_head;
+	enum fuse_pending_type pending_type = FPT_PENDING_LARGE;
+
 	req->in.h.len = sizeof(struct fuse_in_header) +
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
-	list_add_tail(&req->list, &fiq->pending);
-	fiq->ops->wake_pending_and_unlock(fiq);
+
+	if (READ_ONCE(fc->no_splice_for_small_reads) &&
+	    req->in.h.len <= FUSE_REQ_SMALL_QUEUE_SIZE)
+		pending_type = FPT_PENDING_SMALL;
+
+	// printk("queuing to type: %d\n", pending_type);
+	list_head = &fiq->pending[pending_type];
+
+	list_add_tail(&req->list, list_head);
+	fiq->ops->wake_pending_and_unlock(fiq, pending_type);
 }
 
 void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 		       u64 nodeid, u64 nlookup)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
+	enum fuse_pending_type type = READ_ONCE(fc->no_splice_for_small_reads) ?
+		FPT_PENDING_SMALL : FPT_PENDING_LARGE;
 
 	forget->forget_one.nodeid = nodeid;
 	forget->forget_one.nlookup = nlookup;
@@ -245,7 +269,7 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 	if (fiq->connected) {
 		fiq->forget_list_tail->next = forget;
 		fiq->forget_list_tail = forget;
-		fiq->ops->wake_forget_and_unlock(fiq);
+		fiq->ops->wake_forget_and_unlock(fiq, type);
 	} else {
 		kfree(forget);
 		spin_unlock(&fiq->lock);
@@ -264,6 +288,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
 		list_del(&req->list);
 		fc->active_background++;
 		spin_lock(&fiq->lock);
+
 		req->in.h.unique = fuse_get_unique(fiq);
 		queue_request_and_unlock(fiq, req);
 	}
@@ -333,7 +358,10 @@ EXPORT_SYMBOL_GPL(fuse_request_end);
 
 static int queue_interrupt(struct fuse_req *req)
 {
-	struct fuse_iqueue *fiq = &req->fm->fc->iq;
+	struct fuse_conn *fc = req->fm->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
+	enum fuse_pending_type type = READ_ONCE(fc->no_splice_for_small_reads) ?
+		FPT_PENDING_SMALL : FPT_PENDING_LARGE;
 
 	spin_lock(&fiq->lock);
 	/* Check for we've sent request to interrupt this req */
@@ -354,7 +382,7 @@ static int queue_interrupt(struct fuse_req *req)
 			spin_unlock(&fiq->lock);
 			return 0;
 		}
-		fiq->ops->wake_interrupt_and_unlock(fiq);
+		fiq->ops->wake_interrupt_and_unlock(fiq, type);
 	} else {
 		spin_unlock(&fiq->lock);
 	}
@@ -1029,10 +1057,23 @@ static int forget_pending(struct fuse_iqueue *fiq)
 	return fiq->forget_list_head.next != NULL;
 }
 
-static int request_pending(struct fuse_iqueue *fiq)
+static int request_pending(struct fuse_iqueue *fiq, enum fuse_pending_type type)
 {
-	return !list_empty(&fiq->pending) || !list_empty(&fiq->interrupts) ||
-		forget_pending(fiq);
+	bool pending = false;
+	if (type == FPT_PENDING_ANY) {
+		int lt;
+		type -= 1; /* avoid over array access */
+
+		for (lt = 0; lt  <= type; lt++) {
+			if (!list_empty(&fiq->pending[lt])) {
+				pending = true;
+				break;
+			}
+		}
+	} else if (!list_empty(&fiq->pending[type]))
+			pending = true;
+
+	return pending || !list_empty(&fiq->interrupts) || forget_pending(fiq);
 }
 
 /*
@@ -1199,7 +1240,8 @@ __releases(fiq->lock)
  * the 'sent' flag.
  */
 static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
-				struct fuse_copy_state *cs, size_t nbytes)
+				struct fuse_copy_state *cs, size_t nbytes,
+				bool is_splice)
 {
 	ssize_t err;
 	struct fuse_conn *fc = fud->fc;
@@ -1209,6 +1251,8 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	struct fuse_args *args;
 	unsigned reqsize;
 	unsigned int hash;
+	enum fuse_pending_type pend_type = FPT_PENDING_LARGE;
+	struct list_head *pending_list;
 
 	/*
 	 * Require sane minimum read buffer - that has capacity for fixed part
@@ -1230,15 +1274,25 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 
  restart:
 	for (;;) {
+		/* XXX: READ_ONCE( fc->no_splice_for_small_reads) */
+		if (!is_splice && READ_ONCE(fc->no_splice_for_small_reads))
+			pend_type = FPT_PENDING_SMALL;
+
+		pending_list = &fiq->pending[pend_type];
+
+		// printk("splice-for-small=%d is_splice=%d type=%d list=%p",
+		// 	fc->no_splice_for_small_reads, is_splice, pend_type, pending_list);
+
 		spin_lock(&fiq->lock);
-		if (!fiq->connected || request_pending(fiq))
+		if (!fiq->connected || request_pending(fiq, pend_type))
 			break;
 		spin_unlock(&fiq->lock);
 
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		err = wait_event_interruptible_exclusive(fiq->waitq,
-				!fiq->connected || request_pending(fiq));
+		err = wait_event_interruptible_exclusive(fiq->waitq[pend_type],
+				!fiq->connected ||
+				request_pending(fiq, pend_type));
 		if (err)
 			return err;
 	}
@@ -1255,14 +1309,15 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	}
 
 	if (forget_pending(fiq)) {
-		if (list_empty(&fiq->pending) || fiq->forget_batch-- > 0)
+		if (list_empty(&fiq->pending[pend_type]) ||
+		    fiq->forget_batch-- > 0)
 			return fuse_read_forget(fc, fiq, cs, nbytes);
 
 		if (fiq->forget_batch <= -8)
 			fiq->forget_batch = 16;
 	}
 
-	req = list_entry(fiq->pending.next, struct fuse_req, list);
+	req = list_entry(pending_list->next, struct fuse_req, list);
 	clear_bit(FR_PENDING, &req->flags);
 	list_del_init(&req->list);
 	spin_unlock(&fiq->lock);
@@ -1361,7 +1416,7 @@ static ssize_t fuse_dev_read(struct kiocb *iocb, struct iov_iter *to)
 
 	fuse_copy_init(&cs, 1, to);
 
-	return fuse_dev_do_read(fud, file, &cs, iov_iter_count(to));
+	return fuse_dev_do_read(fud, file, &cs, iov_iter_count(to), false);
 }
 
 static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
@@ -1385,7 +1440,7 @@ static ssize_t fuse_dev_splice_read(struct file *in, loff_t *ppos,
 	fuse_copy_init(&cs, 1, NULL);
 	cs.pipebufs = bufs;
 	cs.pipe = pipe;
-	ret = fuse_dev_do_read(fud, in, &cs, len);
+	ret = fuse_dev_do_read(fud, in, &cs, len, true);
 	if (ret < 0)
 		goto out;
 
@@ -2056,17 +2111,32 @@ static __poll_t fuse_dev_poll(struct file *file, poll_table *wait)
 	__poll_t mask = EPOLLOUT | EPOLLWRNORM;
 	struct fuse_iqueue *fiq;
 	struct fuse_dev *fud = fuse_get_dev(file);
+	struct fuse_conn *fc;
 
 	if (!fud)
 		return EPOLLERR;
 
-	fiq = &fud->fc->iq;
-	poll_wait(file, &fiq->waitq, wait);
+	fc = fud->fc;
+
+	/*
+	 * polling is more difficult with the read() for small and splice()
+	 * for large optimization - user space then would need to make sure
+	 * that different FDs are used. This is possible with clone_fd, but
+	 * hard to verifiy in kernel space - for now polling is not supported
+	 * if this feature is enabled.
+	 * In the detail, the difficult part with polling is that multiple
+	 * waitq are defined for that feature, but poll_wait() only accepts one.
+	 */
+	if (READ_ONCE(fc->no_splice_for_small_reads))
+		return EPOLLERR;
+
+	fiq = &fc->iq;
+	poll_wait(file, &fiq->waitq[FPT_PENDING_LARGE], wait);
 
 	spin_lock(&fiq->lock);
 	if (!fiq->connected)
 		mask = EPOLLERR;
-	else if (request_pending(fiq))
+	else if (request_pending(fiq, FPT_PENDING_LARGE))
 		mask |= EPOLLIN | EPOLLRDNORM;
 	spin_unlock(&fiq->lock);
 
@@ -2165,12 +2235,19 @@ void fuse_abort_conn(struct fuse_conn *fc)
 
 		spin_lock(&fiq->lock);
 		fiq->connected = 0;
-		list_for_each_entry(req, &fiq->pending, list)
-			clear_bit(FR_PENDING, &req->flags);
-		list_splice_tail_init(&fiq->pending, &to_end);
+
+		for (i = 0; i < FPT_PENDING_ANY; i++) {
+			list_for_each_entry(req, &fiq->pending[i], list)
+				clear_bit(FR_PENDING, &req->flags);
+			list_splice_tail_init(&fiq->pending[i], &to_end);
+		}
 		while (forget_pending(fiq))
 			kfree(fuse_dequeue_forget(fiq, 1, NULL));
-		wake_up_all(&fiq->waitq);
+
+		for (i = 0; i < FPT_PENDING_ANY; i++) {
+			wake_up_all(&fiq->waitq[i]);
+		}
+
 		spin_unlock(&fiq->lock);
 		kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
 		end_polls(fc);
