@@ -1034,7 +1034,7 @@ static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
 
 static int forget_pending(struct fuse_iqueue *fiq)
 {
-	return fiq->forget_list_head.next != NULL;
+	return READ_ONCE(fiq->forget_list_head.next) != NULL;
 }
 
 static int request_pending(struct fuse_iqueue *fiq)
@@ -1217,6 +1217,7 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	struct fuse_args *args;
 	unsigned reqsize;
 	unsigned int hash;
+	unsigned long expires;
 
 	/*
 	 * Require sane minimum read buffer - that has capacity for fixed part
@@ -1237,18 +1238,26 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 		return -EINVAL;
 
  restart:
+	expires = jiffies + 1;
 	for (;;) {
-		spin_lock(&fiq->lock);
-		if (!fiq->connected || request_pending(fiq))
-			break;
-		spin_unlock(&fiq->lock);
+		if (!READ_ONCE(fiq->connected) || request_pending(fiq)) {
+			spin_lock(&fiq->lock);
+			if (!fiq->connected || request_pending(fiq))
+				break;
+			spin_unlock(&fiq->lock);
+		}
 
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		err = wait_event_interruptible_exclusive(fiq->waitq,
-				!fiq->connected || request_pending(fiq));
+
+		if (time_after_eq(jiffies, expires))
+			err = wait_event_interruptible_exclusive(fiq->waitq,
+					!fiq->connected || request_pending(fiq));
+
 		if (err)
 			return err;
+
+		schedule();
 	}
 
 	if (!fiq->connected) {
