@@ -797,6 +797,9 @@ static void fuse_iqueue_init(struct fuse_iqueue *fiq,
 	fiq->num_dev_readers = 0;
 	fiq->num_dev_waiters = 0;
 	fiq->avoided_wakeup_cnt = 0;
+
+	fiq->last_dev_read_task = NULL;
+	fiq->last_dev_read_woken_task = NULL;
 }
 
 

@@ -455,12 +455,16 @@ struct fuse_iqueue {
         /* Number of tasks reading requests */
         int num_dev_waiters;
 
-        /* Number of tasks reading requests and that went into sleep mode */
         int num_dev_readers;
 
         /* stats, number of wakeup calls that could be avoided */
         u64 avoided_wakeup_cnt;
 
+        /* Number of tasks reading requests and that went into sleep mode */
+	/* The last task that was active reading reading requests.
+	 * Protected by waitq->lock */
+	struct task_struct *last_dev_read_task;
+	struct task_struct *last_dev_read_woken_task;
 };
 
 #define FUSE_PQ_HASH_BITS 8

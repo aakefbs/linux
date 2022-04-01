@@ -220,23 +220,30 @@ __releases(fiq->lock)
 
 	spin_lock(&fiq->waitq.lock);
 
-	/* arbitrary number of requests to wake up when there are too many
-	 * pending requests. Might need to become configurable.
-	 */
 	if (!wake) {
 		if (fiq->num_pending > new_take_wake_queue_sz)
 			wake = true;
 		else {
 			int active = fiq->num_dev_readers - fiq->num_dev_waiters;
 			if (active <= 0) {
-				WARN_ONCE(active < 0, "dev read counter bug");
+				WARN_ONCE(active < 0, "Negative active device read count");
 				wake = true;
 			}
 		}
 	}
 
 	if (wake) {
-		wake_up_locked(&fiq->waitq);
+		bool new_task = false;
+
+		if (fiq->last_dev_read_task == NULL ||
+		    (fiq->num_pending > new_take_wake_queue_sz &&
+		     fiq->last_dev_read_task == fiq->last_dev_read_woken_task))
+			new_task = true;
+
+		if (new_task)
+			wake_up_locked(&fiq->waitq);
+		else
+			wake_up_process(fiq->last_dev_read_task);
 	}
 	else
 		++fiq->avoided_wakeup_cnt; /* just for stats */
@@ -1295,8 +1302,10 @@ static ssize_t _fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 		if (time_after_eq(jiffies, expires)) {
 			spin_lock(&fiq->waitq.lock);
 			++fiq->num_dev_waiters;
+			fiq->last_dev_read_task = current;
 			err = wait_event_interruptible_exclusive_locked(fiq->waitq,
 					!fiq->connected || request_pending(fiq));
+			fiq->last_dev_read_woken_task = current;
 			--fiq->num_dev_waiters;
 			spin_unlock(&fiq->waitq.lock);
 		}
