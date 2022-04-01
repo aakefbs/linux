@@ -788,12 +788,17 @@ static void fuse_iqueue_init(struct fuse_iqueue *fiq,
 	spin_lock_init(&fiq->lock);
 	init_waitqueue_head(&fiq->waitq);
 	INIT_LIST_HEAD(&fiq->pending);
+	fiq->num_pending = 0;
 	INIT_LIST_HEAD(&fiq->interrupts);
 	fiq->forget_list_tail = &fiq->forget_list_head;
 	fiq->connected = 1;
 	fiq->ops = ops;
 	fiq->priv = priv;
+	fiq->num_dev_readers = 0;
+	fiq->num_dev_waiters = 0;
+	fiq->avoided_wakeup_cnt = 0;
 }
+
 
 static void fuse_pqueue_init(struct fuse_pqueue *fpq)
 {
@@ -847,6 +852,9 @@ void fuse_conn_put(struct fuse_conn *fc)
 	if (refcount_dec_and_test(&fc->count)) {
 		struct fuse_iqueue *fiq = &fc->iq;
 		struct fuse_sync_bucket *bucket;
+
+		pr_info("Avoided %llu wake ups\n",
+			 fiq->avoided_wakeup_cnt);
 
 		if (IS_ENABLED(CONFIG_FUSE_DAX))
 			fuse_dax_conn_free(fc);

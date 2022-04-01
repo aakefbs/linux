@@ -430,6 +430,9 @@ struct fuse_iqueue {
 	/** The list of pending requests */
 	struct list_head pending;
 
+	/** Number of pending requests */
+	u64 num_pending;
+
 	/** Pending interrupts */
 	struct list_head interrupts;
 
@@ -448,6 +451,16 @@ struct fuse_iqueue {
 
 	/** Device-specific state */
 	void *priv;
+
+        /* Number of tasks reading requests */
+        int num_dev_waiters;
+
+        /* Number of tasks reading requests and that went into sleep mode */
+        int num_dev_readers;
+
+        /* stats, number of wakeup calls that could be avoided */
+        u64 avoided_wakeup_cnt;
+
 };
 
 #define FUSE_PQ_HASH_BITS 8

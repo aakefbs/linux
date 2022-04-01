@@ -207,18 +207,59 @@ static unsigned int fuse_req_hash(u64 unique)
 /**
  * A new request is available, wake fiq->waitq
  */
-static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq)
+static void _fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq,
+				      bool pending_req_wake)
 __releases(fiq->lock)
 {
-	wake_up(&fiq->waitq);
+	/* arbitrary number of requests to wake up when there are too many
+	 * pending requests. Might need to become configurable.
+	 */
+	const int new_take_wake_queue_sz = 2;
+
+	bool wake = pending_req_wake ? false : true;
+
+	spin_lock(&fiq->waitq.lock);
+
+	/* arbitrary number of requests to wake up when there are too many
+	 * pending requests. Might need to become configurable.
+	 */
+	if (!wake) {
+		if (fiq->num_pending > new_take_wake_queue_sz)
+			wake = true;
+		else {
+			int active = fiq->num_dev_readers - fiq->num_dev_waiters;
+			if (active <= 0) {
+				WARN_ONCE(active < 0, "dev read counter bug");
+				wake = true;
+			}
+		}
+	}
+
+	if (wake) {
+		wake_up_locked(&fiq->waitq);
+	}
+	else
+		++fiq->avoided_wakeup_cnt; /* just for stats */
+
+	spin_unlock(&fiq->waitq.lock);
 	kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
 	spin_unlock(&fiq->lock);
 }
 
+static void fuse_dev_wake_and_unlock_pending(struct fuse_iqueue *fiq)
+{
+	_fuse_dev_wake_and_unlock(fiq, true);
+}
+
+static void fuse_dev_wake_and_unlock_forget_intr(struct fuse_iqueue *fiq)
+{
+	_fuse_dev_wake_and_unlock(fiq, false);
+}
+
 const struct fuse_iqueue_ops fuse_dev_fiq_ops = {
-	.wake_forget_and_unlock		= fuse_dev_wake_and_unlock,
-	.wake_interrupt_and_unlock	= fuse_dev_wake_and_unlock,
-	.wake_pending_and_unlock	= fuse_dev_wake_and_unlock,
+	.wake_forget_and_unlock		= fuse_dev_wake_and_unlock_forget_intr,
+	.wake_interrupt_and_unlock	= fuse_dev_wake_and_unlock_forget_intr,
+	.wake_pending_and_unlock	= fuse_dev_wake_and_unlock_pending
 };
 EXPORT_SYMBOL_GPL(fuse_dev_fiq_ops);
 
@@ -230,6 +271,7 @@ __releases(fiq->lock)
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 	list_add_tail(&req->list, &fiq->pending);
+	++fiq->num_pending;
 	fiq->ops->wake_pending_and_unlock(fiq);
 }
 
@@ -1206,7 +1248,7 @@ __releases(fiq->lock)
  * fuse_request_end().  Otherwise add it to the processing list, and set
  * the 'sent' flag.
  */
-static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+static ssize_t _fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 				struct fuse_copy_state *cs, size_t nbytes)
 {
 	ssize_t err;
@@ -1250,9 +1292,14 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
 
-		if (time_after_eq(jiffies, expires))
-			err = wait_event_interruptible_exclusive(fiq->waitq,
+		if (time_after_eq(jiffies, expires)) {
+			spin_lock(&fiq->waitq.lock);
+			++fiq->num_dev_waiters;
+			err = wait_event_interruptible_exclusive_locked(fiq->waitq,
 					!fiq->connected || request_pending(fiq));
+			--fiq->num_dev_waiters;
+			spin_unlock(&fiq->waitq.lock);
+		}
 
 		if (err)
 			return err;
@@ -1282,6 +1329,7 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	req = list_entry(fiq->pending.next, struct fuse_req, list);
 	clear_bit(FR_PENDING, &req->flags);
 	list_del_init(&req->list);
+	--fiq->num_pending;
 	spin_unlock(&fiq->lock);
 
 	args = req->args;
@@ -1350,6 +1398,26 @@ out_end:
 
  err_unlock:
 	spin_unlock(&fiq->lock);
+	return err;
+}
+
+static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+				struct fuse_copy_state *cs, size_t nbytes)
+{
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
+	int err;
+
+	spin_lock(&fiq->waitq.lock);
+	++fiq->num_dev_readers;
+	spin_unlock(&fiq->waitq.lock);
+
+	err = _fuse_dev_do_read(fud, file, cs, nbytes);
+
+	spin_lock(&fiq->waitq.lock);
+	--fiq->num_dev_readers;
+	spin_unlock(&fiq->waitq.lock);
+
 	return err;
 }
 
@@ -2185,6 +2253,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		list_for_each_entry(req, &fiq->pending, list)
 			clear_bit(FR_PENDING, &req->flags);
 		list_splice_tail_init(&fiq->pending, &to_end);
+		fiq->num_pending = 0;
 		while (forget_pending(fiq))
 			kfree(fuse_dequeue_forget(fiq, 1, NULL));
 		wake_up_all(&fiq->waitq);
