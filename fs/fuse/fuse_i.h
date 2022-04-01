@@ -430,6 +430,9 @@ struct fuse_iqueue {
 	/** The list of pending requests */
 	struct list_head pending;
 
+	/** Number of pending requests */
+	u64 num_pending;
+
 	/** Pending interrupts */
 	struct list_head interrupts;
 
@@ -448,6 +451,13 @@ struct fuse_iqueue {
 
 	/** Device-specific state */
 	void *priv;
+
+	/* Number of tasks reading requests */
+	int num_dev_waiters;
+
+	/* stats, number of wakeup calls that could be avoided */
+	u64 avoided_wakeup_cnt;
+
 };
 
 #define FUSE_PQ_HASH_BITS 8
@@ -833,6 +843,20 @@ struct fuse_conn {
 
 	/* New writepages go into this bucket */
 	struct fuse_sync_bucket __rcu *curr_bucket;
+
+	/* number of thread user space has set up */
+	int num_user_threads;
+
+	/* waking up thread can have a rather high latency. This is the time
+	 * threads might spin before going into the waitq.
+	 */
+	int thread_spin_jiffies;
+
+	/* number of tasks/threads in the dev read function */
+	atomic_t num_in_dev_read;
+
+	/* number of tasks/threads reading requests */
+	atomic_t num_dev_req_read;
 };
 
 /*

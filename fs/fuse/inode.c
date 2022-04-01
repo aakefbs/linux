@@ -788,12 +788,16 @@ static void fuse_iqueue_init(struct fuse_iqueue *fiq,
 	spin_lock_init(&fiq->lock);
 	init_waitqueue_head(&fiq->waitq);
 	INIT_LIST_HEAD(&fiq->pending);
+	fiq->num_pending = 0;
 	INIT_LIST_HEAD(&fiq->interrupts);
 	fiq->forget_list_tail = &fiq->forget_list_head;
 	fiq->connected = 1;
 	fiq->ops = ops;
 	fiq->priv = priv;
+	fiq->num_dev_waiters = 0;
+	fiq->avoided_wakeup_cnt = 0;
 }
+
 
 static void fuse_pqueue_init(struct fuse_pqueue *fpq)
 {
@@ -839,6 +843,11 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);
 	fm->fc = fc;
+
+	fc->num_user_threads = -1;
+	fc->thread_spin_jiffies = -1;
+	atomic_set(&fc->num_dev_req_read, 0);
+	atomic_set(&fc->num_in_dev_read, 0);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_init);
 
@@ -847,6 +856,8 @@ void fuse_conn_put(struct fuse_conn *fc)
 	if (refcount_dec_and_test(&fc->count)) {
 		struct fuse_iqueue *fiq = &fc->iq;
 		struct fuse_sync_bucket *bucket;
+
+		pr_debug("Avoided %llu wake ups\n",  fiq->avoided_wakeup_cnt);
 
 		if (IS_ENABLED(CONFIG_FUSE_DAX))
 			fuse_dax_conn_free(fc);
@@ -1189,6 +1200,16 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->setxattr_ext = 1;
 			if (flags & FUSE_SECURITY_CTX)
 				fc->init_security = 1;
+			if (flags & FUSE_N_DEV_READ_THREADS) {
+				WRITE_ONCE(fc->num_user_threads,
+					   arg->num_userspace_threads);
+				pr_info("threads %d\n", fc->num_user_threads);
+			}
+			if (flags & FUSE_DEV_THREAD_SPIN) {
+				WRITE_ONCE(fc->thread_spin_jiffies,
+					   arg->thread_spin_jiffies);
+				pr_info("spin jiffies: %d\n", fc->thread_spin_jiffies);
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1234,7 +1255,7 @@ void fuse_send_init(struct fuse_mount *fm)
 		FUSE_ABORT_ERROR | FUSE_MAX_PAGES | FUSE_CACHE_SYMLINKS |
 		FUSE_NO_OPENDIR_SUPPORT | FUSE_EXPLICIT_INVAL_DATA |
 		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
-		FUSE_SECURITY_CTX;
+		FUSE_SECURITY_CTX | FUSE_N_DEV_READ_THREADS | FUSE_DEV_THREAD_SPIN;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;

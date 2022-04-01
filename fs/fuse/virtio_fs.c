@@ -1231,6 +1231,7 @@ __releases(fiq->lock)
 	req = list_last_entry(&fiq->pending, struct fuse_req, list);
 	clear_bit(FR_PENDING, &req->flags);
 	list_del_init(&req->list);
+	--fiq->num_pending;
 	WARN_ON(!list_empty(&fiq->pending));
 	spin_unlock(&fiq->lock);
 
