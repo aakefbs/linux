@@ -2249,12 +2249,44 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	return 0;
 }
 
+static int fuse_dev_setup_uring(struct file *file, struct fuse_uring_cfg *cfg)
+{
+	struct fuse_dev *fud = fuse_get_dev(file);
+	struct fuse_conn *fc;
+	size_t queue_size;
+
+	if (fud == NULL)
+		return -ENODEV;
+
+	fc = fud->fc;
+
+	if (cfg->per_core_queue) {
+		if (!cpu_possible(cfg->num_queues - 1)) {
+			pr_info("per-core-queue, but number of queue "
+				"mismatches number of cpus");
+			return -EINVAL;
+		}
+	else
+		if (cfg->num_queues != 1) {
+			pr_info("Per-core-queue not set, expecting a single "
+				"queue");
+			return -EINVAL;
+		}
+	}
+
+	queue_size = sizeof(*fc->ring.queues) * cfg->queue_depth;
+	fc->ring.queues = kcalloc(cfg->num_queues, queue_size, GFP_KERNEL);
+
+	return 0;
+}
+
 static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
 {
 	int res;
 	int oldfd;
 	struct fuse_dev *fud = NULL;
+	struct fuse_uring_cfg ring_conf;
 
 	switch (cmd) {
 	case FUSE_DEV_IOC_CLONE:
@@ -2279,6 +2311,14 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 				fput(old);
 			}
 		}
+		break;
+	case FUSE_DEV_IOC_URING:
+		res = copy_from_user(&ring_conf, (void *)arg, sizeof(ring_conf));
+		if (res == 0)
+			res = fuse_dev_setup_uring(file, &ring_conf);
+		else
+			res = -EFAULT;
+
 		break;
 	default:
 		res = -ENOTTY;

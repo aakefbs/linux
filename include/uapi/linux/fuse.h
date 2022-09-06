@@ -966,9 +966,20 @@ struct fuse_notify_retrieve_in {
 	uint64_t	dummy4;
 };
 
+struct fuse_uring_cfg {
+	uint64_t	flags; /* possible compat flags, unused for now */
+	uint32_t	num_queues;
+	uint32_t	per_core_queue:1;
+	uint32_t	queue_depth;
+	uint32_t	padding1;
+	uint64_t 	padding[8]; /* reserve space for future additions */
+};
+
 /* Device ioctls: */
 #define FUSE_DEV_IOC_MAGIC		229
 #define FUSE_DEV_IOC_CLONE		_IOR(FUSE_DEV_IOC_MAGIC, 0, uint32_t)
+#define FUSE_DEV_IOC_URING		_IOR(FUSE_DEV_IOC_MAGIC, 1, \
+					     struct fuse_uring_cfg)
 
 struct fuse_lseek_in {
 	uint64_t	fh;
