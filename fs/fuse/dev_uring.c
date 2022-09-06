@@ -34,6 +34,9 @@ module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
 	"Enable uring userspace communication through uring.");
 
+static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent);
+static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent);
+
 static struct fuse_ring_queue *
 fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 {
@@ -45,15 +48,6 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 	}
 
 	return (struct fuse_ring_queue *)(ptr + qid * fc->ring.queue_size);
-}
-
-/* dummy function will be replaced in later commits */
-static void fuse_uring_bit_set(struct fuse_ring_ent *ent, bool is_bg,
-			       const char *str)
-{
-	(void)ent;
-	(void)is_bg;
-	(void)str;
 }
 
 /* Abort all list queued request on the given ring queue */
@@ -79,6 +73,363 @@ void fuse_uring_end_requests(struct fuse_conn *fc)
 
 		fuse_uring_end_queue_requests(queue);
 	}
+}
+
+/*
+ * Finalize a fuse request, then fetch and send the next entry, if available
+ *
+ * has lock/unlock/lock to avoid holding the lock on calling fuse_request_end
+ */
+static void
+fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
+				int error)
+{
+	bool already = false;
+	struct fuse_req *req = ring_ent->fuse_req;
+	bool send;
+
+	spin_lock(&ring_ent->queue->lock);
+	if (ring_ent->state & FRRS_FUSE_REQ_END || !ring_ent->need_req_end)
+		already = true;
+	else {
+		ring_ent->state |= FRRS_FUSE_REQ_END;
+		ring_ent->need_req_end = 0;
+	}
+	spin_unlock(&ring_ent->queue->lock);
+
+	if (already) {
+		struct fuse_ring_queue *queue = ring_ent->queue;
+
+		if (!queue->aborted) {
+			pr_info("request end not needed state=%llu end-bit=%d\n",
+				ring_ent->state, ring_ent->need_req_end);
+			WARN_ON(1);
+		}
+		return;
+	}
+
+	if (set_err)
+		req->out.h.error = error;
+
+	fuse_request_end(ring_ent->fuse_req);
+	ring_ent->fuse_req = NULL;
+
+	send = fuse_uring_ent_release_and_fetch(ring_ent);
+	if (send)
+		fuse_uring_send_to_ring(ring_ent);
+}
+
+/*
+ * Copy data from the req to the ring buffer
+ */
+static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
+				   struct fuse_req *req,
+				   struct fuse_ring_req *rreq)
+{
+	struct fuse_copy_state cs;
+	struct fuse_args *args = req->args;
+	int err;
+
+	fuse_copy_init(&cs, 1, NULL);
+	cs.is_uring = 1;
+	cs.ring.buf = rreq->in_out_arg;
+	cs.ring.buf_sz = fc->ring.req_arg_len;
+	cs.req = req;
+
+	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
+		 cs.ring.buf, cs.ring.buf_sz, args->out_numargs);
+
+	err = fuse_copy_args(&cs, args->in_numargs, args->in_pages,
+			     (struct fuse_arg *) args->in_args, 0);
+	rreq->in_out_arg_len = cs.ring.offset;
+
+	pr_devel("%s:%d buf=%p len=%d args=%d err=%d\n", __func__, __LINE__,
+		 cs.ring.buf, cs.ring.buf_sz, args->out_numargs, err);
+
+	return err;
+}
+
+/*
+ * Copy data from the ring buffer to the fuse request
+ */
+static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
+				     struct fuse_req *req,
+				     struct fuse_ring_req *rreq)
+{
+	struct fuse_copy_state cs;
+	struct fuse_args *args = req->args;
+
+	fuse_copy_init(&cs, 0, NULL);
+	cs.is_uring = 1;
+	cs.ring.buf = rreq->in_out_arg;
+
+	if (rreq->in_out_arg_len > fc->ring.req_arg_len) {
+		pr_devel("Max ring buffer len exceeded (%u vs %zu\n",
+			 rreq->in_out_arg_len,  fc->ring.req_arg_len);
+		return -EINVAL;
+	}
+	cs.ring.buf_sz = rreq->in_out_arg_len;
+	cs.req = req;
+
+	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
+		 cs.ring.buf, cs.ring.buf_sz, args->out_numargs);
+
+	return fuse_copy_out_args(&cs, args, rreq->in_out_arg_len);
+}
+
+/**
+ * Write data to the ring buffer and send the request to userspace,
+ * userspace will read it
+ * This is comparable with classical read(/dev/fuse)
+ */
+static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent)
+{
+	struct fuse_conn *fc = ring_ent->queue->fc;
+	struct fuse_ring_req *rreq = ring_ent->rreq;
+	struct fuse_req *req = ring_ent->fuse_req;
+	int err = 0;
+
+	pr_devel("%s:%d ring-req=%p fuse_req=%p state=%llu args=%p\n", __func__,
+		 __LINE__, ring_ent, ring_ent->fuse_req, ring_ent->state, req->args);
+
+	spin_lock(&ring_ent->queue->lock);
+	if (unlikely((ring_ent->state & FRRS_USERSPACE) ||
+		     (ring_ent->state & FRRS_FREED))) {
+		pr_err("ring-req=%p buf_req=%p invalid state %llu on send\n",
+		       ring_ent, rreq, ring_ent->state);
+		WARN_ON(1);
+		err = -EIO;
+	} else
+		ring_ent->state |= FRRS_USERSPACE;
+
+	ring_ent->need_cmd_done = 0;
+	spin_unlock(&ring_ent->queue->lock);
+	if (err)
+		goto err;
+
+	err = fuse_uring_copy_to_ring(fc, req, rreq);
+	if (unlikely(err)) {
+		ring_ent->state &= ~FRRS_USERSPACE;
+		ring_ent->need_cmd_done = 1;
+		goto err;
+	}
+
+	/* ring req go directly into the shared memory buffer */
+	rreq->in = req->in.h;
+
+	pr_devel("%s qid=%d tag=%d state=%llu cmd-done op=%d unique=%llu\n",
+		__func__, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
+		rreq->in.opcode, rreq->in.unique);
+
+	io_uring_cmd_done(ring_ent->cmd, 0, 0);
+	return;
+
+err:
+	fuse_uring_req_end_and_get_next(ring_ent, true, err);
+}
+
+/**
+ * Set the given ring entry as available in the queue bitmap
+ */
+static void fuse_uring_bit_set(struct fuse_ring_ent *ring_ent, bool bg,
+			       const char *str)
+__must_hold(ring_ent->queue->lock)
+{
+	int old;
+	struct fuse_ring_queue *queue = ring_ent->queue;
+	const struct fuse_conn *fc = queue->fc;
+	int tag = ring_ent->tag;
+
+	old = test_and_set_bit(tag, queue->req_avail_map);
+	if (unlikely(old != 0)) {
+		pr_warn("%8s invalid bit value on clear for qid=%d tag=%d",
+			str, queue->qid, tag);
+		WARN_ON(1);
+	}
+	if (bg)
+		queue->req_bg++;
+	else
+		queue->req_fg++;
+
+	pr_devel("%35s bit set fc=%p is_bg=%d qid=%d tag=%d fg=%d bg=%d bgq: %d\n",
+		 str, fc, bg, queue->qid, ring_ent->tag, queue->req_fg,
+		 queue->req_bg, !list_empty(&queue->bg_queue));
+}
+
+/**
+ * Mark the ring entry as not available for other requests
+ */
+static int fuse_uring_bit_clear(struct fuse_ring_ent *ring_ent, int is_bg,
+				const char *str)
+__must_hold(ring_ent->queue->lock)
+{
+	int old;
+	struct fuse_ring_queue *queue = ring_ent->queue;
+	const struct fuse_conn *fc = queue->fc;
+	int tag = ring_ent->tag;
+	int *value = is_bg ? &queue->req_bg : &queue->req_fg;
+
+	if (unlikely(*value <= 0)) {
+		pr_warn("%s qid=%d tag=%d is_bg=%d zero req avail fg=%d bg=%d\n",
+			str, queue->qid, ring_ent->tag, is_bg,
+			queue->req_bg, queue->req_fg);
+		WARN_ON(1);
+		return -EINVAL;
+	}
+
+	old = test_and_clear_bit(tag, queue->req_avail_map);
+	if (unlikely(old != 1)) {
+		pr_warn("%8s invalid bit value on clear for qid=%d tag=%d",
+			str, queue->qid, tag);
+		WARN_ON(1);
+		return -EIO;
+	}
+
+	ring_ent->rreq->flags = 0;
+
+	if (is_bg) {
+		ring_ent->rreq->flags |= FUSE_RING_REQ_FLAG_BACKGROUND;
+		queue->req_bg--;
+	} else
+		queue->req_fg--;
+
+	pr_devel("%35s ring bit clear fc=%p is_bg=%d qid=%d tag=%d fg=%d bg=%d\n",
+		 str, fc, is_bg, queue->qid, ring_ent->tag,
+		 queue->req_fg, queue->req_bg);
+
+	ring_ent->state |= FRRS_FUSE_REQ;
+
+	return 0;
+}
+
+/*
+ * Assign a fuse queue entry to the given entry
+ *
+ */
+static bool fuse_uring_assign_ring_entry(struct fuse_ring_ent *ring_ent,
+					     struct list_head *head,
+					     int is_bg)
+__must_hold(&queue.waitq.lock)
+{
+	struct fuse_req *req;
+	int res;
+
+	if (list_empty(head))
+		return false;
+
+	res = fuse_uring_bit_clear(ring_ent, is_bg, __func__);
+	if (unlikely(res))
+		return false;
+
+	req = list_first_entry(head, struct fuse_req, list);
+	list_del_init(&req->list);
+	clear_bit(FR_PENDING, &req->flags);
+	ring_ent->fuse_req = req;
+	ring_ent->need_req_end = 1;
+
+	return true;
+}
+
+/*
+ * Checks for errors and stores it into the request
+ */
+static int fuse_uring_ring_ent_has_err(struct fuse_conn *fc,
+				       struct fuse_ring_ent *ring_ent)
+{
+	struct fuse_req *req = ring_ent->fuse_req;
+	struct fuse_out_header *oh = &req->out.h;
+	int err;
+
+	if (oh->unique == 0) {
+		/* Not supportd through request based uring, this needs another
+		 * ring from user space to kernel
+		 */
+		pr_warn("Unsupported fuse-notify\n");
+		err = -EINVAL;
+		goto seterr;
+	}
+
+	if (oh->error <= -512 || oh->error > 0) {
+		err = -EINVAL;
+		goto seterr;
+	}
+
+	if (oh->error) {
+		err = oh->error;
+		pr_devel("%s:%d err=%d op=%d req-ret=%d",
+			 __func__, __LINE__, err, req->args->opcode,
+			 req->out.h.error);
+		goto err; /* error already set */
+	}
+
+	if ((oh->unique & ~FUSE_INT_REQ_BIT) != req->in.h.unique) {
+
+		pr_warn("Unpexted seqno mismatch, expected: %llu got %llu\n",
+			req->in.h.unique, oh->unique & ~FUSE_INT_REQ_BIT);
+		err = -ENOENT;
+		goto seterr;
+	}
+
+	/* Is it an interrupt reply ID?	 */
+	if (oh->unique & FUSE_INT_REQ_BIT) {
+		err = 0;
+		if (oh->error == -ENOSYS)
+			fc->no_interrupt = 1;
+		else if (oh->error == -EAGAIN) {
+			/* XXX Needs to copy to the next cq and submit it */
+			// err = queue_interrupt(req);
+			pr_warn("Intrerupt EAGAIN not supported yet");
+			err = -EINVAL;
+		}
+
+		goto seterr;
+	}
+
+	return 0;
+
+seterr:
+	pr_devel("%s:%d err=%d op=%d req-ret=%d",
+		 __func__, __LINE__, err, req->args->opcode,
+		 req->out.h.error);
+	oh->error = err;
+err:
+	pr_devel("%s:%d err=%d op=%d req-ret=%d",
+		 __func__, __LINE__, err, req->args->opcode,
+		 req->out.h.error);
+	return err;
+}
+
+/**
+ * Read data from the ring buffer, which user space has written to
+ * This is comparible with handling of classical write(/dev/fuse).
+ * Also make the ring request available again for new fuse requests.
+ */
+static void fuse_uring_commit_and_release(struct fuse_dev *fud,
+					  struct fuse_ring_ent *ring_ent)
+{
+	struct fuse_ring_req *rreq = ring_ent->rreq;
+	struct fuse_req *req = ring_ent->fuse_req;
+	ssize_t err = 0;
+	bool set_err = false;
+
+	req->out.h = rreq->out;
+
+	err = fuse_uring_ring_ent_has_err(fud->fc, ring_ent);
+	if (err) {
+		/* req->out.h.error already set */
+		pr_devel("%s:%d err=%zd oh->err=%d\n",
+			 __func__, __LINE__, err, req->out.h.error);
+		goto out;
+	}
+
+	err = fuse_uring_copy_from_ring(fud->fc, req, rreq);
+	if (err)
+		set_err = true;
+
+out:
+	pr_devel("%s:%d ret=%zd op=%d req-ret=%d\n",
+		 __func__, __LINE__, err, req->args->opcode, req->out.h.error);
+	fuse_uring_req_end_and_get_next(ring_ent, set_err, err);
 }
 
 /*
@@ -119,6 +470,25 @@ __must_hold(&queue->lock)
 	ring_ent->rreq->flags = 0;
 	ring_ent->state = FRRS_FUSE_WAIT;
 }
+
+/*
+ * Release a uring entry and fetch the next fuse request if available
+ */
+static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent)
+{
+	struct fuse_ring_queue *queue = ring_ent->queue;
+	bool is_bg = !!(ring_ent->rreq->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
+	bool send = false;
+	struct list_head *head = is_bg ? &queue->bg_queue : &queue->fg_queue;
+
+	spin_lock(&ring_ent->queue->lock);
+	fuse_uring_ent_release(ring_ent, queue, is_bg);
+	send = fuse_uring_assign_ring_entry(ring_ent, head, is_bg);
+	spin_unlock(&ring_ent->queue->lock);
+
+	return send;
+}
+
 /**
  * Simplified ring-entry release function, for shutdown only
  */
@@ -812,6 +1182,26 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		}
 
 		ret = fuse_uring_fetch(ring_ent, cmd);
+		break;
+	case FUSE_URING_REQ_COMMIT_AND_FETCH:
+		if (unlikely(!fc->ring.ready)) {
+			pr_info("commit and fetch, but the ring is not ready yet");
+			goto out;
+		}
+
+		if (!(prev_state & FRRS_USERSPACE)) {
+			pr_info("qid=%d tag=%d state %llu misses %d\n",
+				queue->qid, ring_ent->tag, ring_ent->state,
+				FRRS_USERSPACE);
+			goto out;
+		}
+
+		/* XXX Test inject error */
+
+		WRITE_ONCE(ring_ent->cmd, cmd);
+		fuse_uring_commit_and_release(fud, ring_ent);
+
+		ret = 0;
 		break;
 	default:
 		ret = -EINVAL;
