@@ -2332,6 +2332,7 @@ const struct file_operations fuse_dev_operations = {
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
 	.mmap		= fuse_uring_mmap,
+	.uring_cmd	= fuse_uring_cmd,
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 
