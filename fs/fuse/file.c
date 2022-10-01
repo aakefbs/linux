@@ -1396,6 +1396,8 @@ static int fuse_get_user_pages(struct fuse_args_pages *ap, struct iov_iter *ii,
 	size_t nbytes = 0;  /* # bytes already packed in req */
 	ssize_t ret = 0;
 
+	pr_debug("%s:%d", __func__, __LINE__);
+
 	/* Special case for kernel I/O: can copy directly into the buffer */
 	if (iov_iter_is_kvec(ii)) {
 		unsigned long user_addr = fuse_get_user_addr(ii);
