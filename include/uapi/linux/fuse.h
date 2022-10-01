@@ -951,12 +951,23 @@ struct fuse_notify_retrieve_in {
 };
 
 struct fuse_uring_cfg {
-	uint64_t	flags; /* possible compat flags, unused for now */
-	uint32_t	num_queues;
-	uint32_t	per_core_queue:1;
-	uint32_t	queue_depth;
-	uint32_t	padding1;
-	uint64_t 	padding[8]; /* reserve space for future additions */
+	/* possible compat flags, unused for now */
+	uint64_t	compat_flags;
+
+	/* flag to have a queue per cpu core */
+	uint64_t	per_core_queue:1;
+
+	/* number of queues */
+	uint16_t	num_queues;
+
+	/* number of entries per queue */
+	uint16_t	queue_depth;
+
+	/* for all queues and their requests */
+	uint32_t	mmap_req_size;
+
+	/* reserved space for future additions */
+	uint64_t	padding2[8];
 };
 
 /* Device ioctls: */
@@ -1040,6 +1051,80 @@ struct fuse_secctx {
 struct fuse_secctx_header {
 	uint32_t	size;
 	uint32_t	nr_secctx;
+};
+
+
+/**
+ * Size of the ring buffer header
+ */
+#define FUSE_RING_HEADER_BUF_SIZE 4096
+#define FUSE_RING_IN_OUT_ARG_SIZE 4096
+
+enum fuse_ring_req_cmd {
+	FUSE_RING_BUF_CMD_INVALID = 0,
+
+	/* return an iovec pointer */
+	FUSE_RING_BUF_CMD_IOVEC = 1,
+
+	/* report an error */
+	FUSE_RING_BUF_CMD_ERROR = 2,
+};
+
+/**
+ * This structure mapped onto the
+ */
+struct fuse_uring_buf_req {
+
+	union {
+		/* The first 4K are command data */
+		char ring_header[FUSE_RING_HEADER_BUF_SIZE];
+
+		struct {
+			uint64_t flags;
+
+			/* enum fuse_ring_buf_cmd */
+			uint32_t cmd;
+			uint32_t in_out_arg_len;
+
+			/* kernel fills in, reads out */
+			union {
+				struct fuse_in_header in;
+				struct fuse_out_header out;
+			};
+		};
+	};
+
+	char in_out_arg[FUSE_RING_IN_OUT_ARG_SIZE];
+	char data[];
+};
+
+/**
+ * sqe commands to the kernel
+ */
+enum fuse_uring_cmd {
+	FUSE_URING_REQ_INVALID = 0,
+
+	/* submit sqe to kernel to get a request */
+	FUSE_URING_REQ_FETCH = 1,
+
+	/* commit result and fetch next request */
+	FUSE_URING_REQ_COMMIT_AND_FETCH = 2,
+};
+
+/**
+ * In the 80B command area of the SQE.
+ */
+struct fuse_uring_cmd_req {
+	/* queue the command is for (queue index) */
+	uint16_t q_id;
+
+	/* queue entry (array index) */
+	uint16_t tag;
+
+	uint32_t req_buf_len;
+
+	/* pointer to struct fuse_uring_buf_req */
+	uint64_t req_buf;
 };
 
 #endif /* _LINUX_FUSE_H */

@@ -529,12 +529,33 @@ struct fuse_sync_bucket {
 	struct rcu_head rcu;
 };
 
-struct fuse_ring_req {
-	/* userspace buffer address from io cmd */
-	__u64	addr;
+enum fuse_ring_req_state {
+	FUSE_RING_REQ_STATE_INIT   = 0,
+	FUSE_RING_REQ_STATE_WAITING, /* waiting for application requests */
+	FUSE_RING_REQ_STATE_REQ, /* processing a requst */
+	FUSE_RING_REQ_STATE_COMMIT,  /* active in the kernel, committing data */
+	FUSE_RING_REQ_STATE_USERSPACE
+};
 
-	// unsigned int flags;
+struct fuse_ring_req {
+	/* pointer to kernel request buffer, userspace side has mmaped
+	 * this */
+	struct fuse_uring_buf_req *kbuf;
+
+	int tag;
+
+	/* back pointer */
+	struct fuse_conn *fc;
+
+	/* set from uring sqe */
+	struct fuse_uring_buf_req *user_ptr;
+	size_t addr_len;
+
+	/* XXX CAS all states */
+	enum fuse_ring_req_state state;
 	// int res;
+
+	struct fuse_req req;
 
 	struct io_uring_cmd *cmd;
 };
@@ -544,7 +565,7 @@ struct fuse_ring_queue {
 
 	unsigned long flags;
 	// struct task_struct	*fuse_daemon;
-	char *io_cmd_buf;
+	// char *io_cmd_buf;
 
 	// unsigned long io_addr;	/* mapped vm address */
 	// bool abort_work_pending;
@@ -552,7 +573,9 @@ struct fuse_ring_queue {
 
 	struct fuse_conn *fc;
 
-	int cpu; // cpu identifier the queue is assigned to
+	int q_id;
+
+	atomic_t req_cnt;
 
 	/* size depends on queue depth */
 	struct fuse_ring_req ring_req[];
@@ -864,11 +887,14 @@ struct fuse_conn {
 	struct fuse_sync_bucket __rcu *curr_bucket;
 
 	/** queues for request handling via uring */
-	struct ring {
+	struct ring { /* XXX: Move to struct fuse_dev? */
+		spinlock_t lock;
 		unsigned int max_io_sz;
 		size_t nr_queues;
 		size_t queue_depth;
+		size_t ring_req_size;
 		struct fuse_ring_queue *queues;
+		int per_core_queue:1;
 	} ring;
 };
 

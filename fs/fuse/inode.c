@@ -24,6 +24,7 @@
 #include <linux/posix_acl.h>
 #include <linux/pid_namespace.h>
 #include <uapi/linux/magic.h>
+#include <linux/vmalloc.h>
 
 MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Filesystem in Userspace");
@@ -822,6 +823,8 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 		    struct user_namespace *user_ns,
 		    const struct fuse_iqueue_ops *fiq_ops, void *fiq_priv)
 {
+	pr_debug("%s:%d Here\n", __func__, __LINE__);
+
 	memset(fc, 0, sizeof(*fc));
 	spin_lock_init(&fc->lock);
 	spin_lock_init(&fc->bg_lock);
@@ -847,6 +850,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->user_ns = get_user_ns(user_ns);
 	fc->max_pages = FUSE_DEFAULT_MAX_PAGES_PER_REQ;
 	fc->max_pages_limit = FUSE_MAX_MAX_PAGES;
+	spin_lock_init(&fc->ring.lock);
 
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);
@@ -856,6 +860,8 @@ EXPORT_SYMBOL_GPL(fuse_conn_init);
 
 void fuse_conn_put(struct fuse_conn *fc)
 {
+	pr_debug("%s:%d Conn put %p \n", __func__, __LINE__, fc);
+
 	if (refcount_dec_and_test(&fc->count)) {
 		struct fuse_iqueue *fiq = &fc->iq;
 		struct fuse_sync_bucket *bucket;
@@ -878,6 +884,8 @@ EXPORT_SYMBOL_GPL(fuse_conn_put);
 
 struct fuse_conn *fuse_conn_get(struct fuse_conn *fc)
 {
+	pr_debug("%s:%d Conn get %p \n", __func__, __LINE__, fc);
+
 	refcount_inc(&fc->count);
 	return fc;
 }
@@ -1760,6 +1768,8 @@ bool fuse_mount_remove(struct fuse_mount *fm)
 	struct fuse_conn *fc = fm->fc;
 	bool last = false;
 
+	pr_debug("%s:%d Here\n", __func__, __LINE__);
+
 	down_write(&fc->killsb);
 	list_del_init(&fm->fc_entry);
 	if (list_empty(&fc->mounts))
@@ -1773,6 +1783,8 @@ EXPORT_SYMBOL_GPL(fuse_mount_remove);
 void fuse_conn_destroy(struct fuse_mount *fm)
 {
 	struct fuse_conn *fc = fm->fc;
+
+	pr_debug("%s:%d Here\n", __func__, __LINE__);
 
 	if (fc->destroy)
 		fuse_send_destroy(fm);
@@ -1803,6 +1815,8 @@ static void fuse_sb_destroy(struct super_block *sb)
 
 void fuse_mount_destroy(struct fuse_mount *fm)
 {
+	pr_debug("%s:%d Here\n", __func__, __LINE__);
+
 	fuse_conn_put(fm->fc);
 	kfree(fm);
 }

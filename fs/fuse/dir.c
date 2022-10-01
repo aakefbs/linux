@@ -1100,6 +1100,7 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 	args.out_args[0].size = sizeof(outarg);
 	args.out_args[0].value = &outarg;
 	err = fuse_simple_request(fm, &args);
+	pr_debug("%s:%d err=%d\n", __func__, __LINE__, err);
 	if (!err) {
 		if (fuse_invalid_attr(&outarg.attr) ||
 		    inode_wrong_type(inode, outarg.attr.mode)) {
