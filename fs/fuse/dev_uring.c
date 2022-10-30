@@ -27,93 +27,34 @@
 #include <asm/io.h>
 #include <linux/io_uring.h>
 
-static int fuse_uring_copy_to_ring(struct fuse_uring_buf_req *buf_req,
-				   unsigned numargs,  struct fuse_arg *args,
-				   unsigned argpages)
+
+static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
+				   struct fuse_req *req,
+				   struct fuse_uring_buf_req *buf_req)
 {
-	int idx;
-	int off = 0;
+	struct fuse_copy_state cs;
+	struct fuse_args *args = req->args;
+	int err;
+	size_t max_buf = sizeof(buf_req->in_out_arg) + fc->ring.ring_req_size;
 
-	if (argpages) {
-		pr_debug("FIXME, argpages set\n");
-		dump_stack();
-		return -EIO; /* FIXME, add support */
-	}
+	fuse_copy_init(&cs, 1, NULL);
+	cs.is_uring = 1;
+	cs.ring.buf = buf_req->in_out_arg;
+	cs.ring.len = max_buf;
+	cs.req = req;
 
-	for (idx = 0; idx < numargs; idx++) {
-		struct fuse_arg *arg = &args[idx];
-		int len = arg->size;
-		char *ring_buf = buf_req->in_out_arg + off;
+	pr_debug("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
+		 cs.ring.buf, cs.ring.len, args->out_numargs);
 
-		if (off + len > sizeof(buf_req->in_out_arg)) {
-			pr_info("off=%d + len=%d > max-buf-sz=%zu\n",
-				off, len, sizeof(buf_req->in_out_arg));
-			return -ENOSPC;
-		}
+	err = fuse_copy_args(&cs, args->in_numargs, args->in_pages,
+			     (struct fuse_arg *) args->in_args, 0);
+	buf_req->in_out_arg_len = cs.ring.offset;
 
-		memcpy(ring_buf, arg->value, len);
+	pr_debug("%s:%d buf=%p len=%d args=%d err=%d\n", __func__, __LINE__,
+		 cs.ring.buf, cs.ring.len, args->out_numargs, err);
 
-		off += len;
-	}
-
-	buf_req->in_out_arg_len = off;
-
-	return 0;
+	return err;
 }
-
-#if 0
-static int fuse_uring_copy_from_ring(struct fuse_uring_buf_req *buf_req,
-				     unsigned numargs, struct fuse_arg *args,
-				     unsigned argpages)
-{
-	int idx;
-	int off = 0;
-
-	if (argpages) {
-		pr_debug("FIXME, argpages set\n");
-		dump_stack();
-		return -EIO; /* FIXME, add support */
-	}
-
-	for (idx = 0; idx < numargs; idx++) {
-		struct fuse_arg *arg = &args[idx];
-		int len;
-		char *ring_buf = buf_req->in_out_arg + off;
-
-		int ring_len = buf_req->in_out_arg_len - off;
-
-		if (unlikely(ring_len < 0)) {
-			/* This would be a bug in the code - more data copied
-			 * than available
-			 */
-			WARN_ONCE(1, "Invalid number of data copied\n");
-			return -EIO;
-		}
-
-		if (ring_len == 0) {
-			pr_debug("Insufficient number of data for arg-idx=%d\n",
-				 idx);
-			return -EINVAL;
-		}
-
-		len = min(arg->size, (unsigned)ring_len);
-
-		if (off + len > sizeof(buf_req->in_out_arg)) {
-			pr_debug("off=%d + len=%d > max-buf-sz=%zu\n",
-				off, len, sizeof(buf_req->in_out_arg));
-			return -EINVAL;
-		}
-
-		memcpy(arg->value, ring_buf, len);
-
-		off += len;
-
-		pr_debug(":%s Copied arg=%d len=%d\n", __func__, idx, len);
-	}
-
-	return 0;
-}
-#endif
 
 static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
 				     struct fuse_req *req,
@@ -144,9 +85,9 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
 
 int fuse_dev_uring_read(struct fuse_ring_req *ring_req)
 {
+	struct fuse_conn *fc = ring_req->fc;
 	struct fuse_uring_buf_req *buf_req = ring_req->kbuf;
 	struct fuse_req *req = &ring_req->req;
-	struct fuse_args *args = req->args;
 	int err = -EIO;
 
 	pr_debug("%s:%d Here ring-req=%p buf_req=%p state=%d args=%p \n",
@@ -158,9 +99,7 @@ int fuse_dev_uring_read(struct fuse_ring_req *ring_req)
 		goto err;
 	}
 
-	err = fuse_uring_copy_to_ring(buf_req, args->in_numargs,
-				      (struct fuse_arg *)args->in_args,
-				      args->in_pages);
+	err = fuse_uring_copy_to_ring(fc, req, buf_req);
 	if (err)
 		goto err;
 
