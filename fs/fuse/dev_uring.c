@@ -27,6 +27,9 @@
 #include <asm/io.h>
 #include <linux/io_uring.h>
 
+/* default monitor interval for a dying daemon */
+#define FURING_DAEMON_MON_PERIOD (5 * HZ)
+
 
 static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
 				   struct fuse_req *req,
@@ -430,36 +433,49 @@ out:
 EXPORT_SYMBOL(fuse_dev_uring);
 
 
+void fuse_uring_free_req(struct fuse_conn *fc,  struct fuse_ring_req *req,
+			 int qid, int tag)
+{
+	int state;
+
+	state = READ_ONCE(req->state);
+	pr_debug("qid=%d tag=%d state=%d\n", qid, tag, state);
+
+	/* XXX Memory and command leak for commands
+	 * in flight!
+	 * XXX Racy
+	 */
+	if (state == FUSE_RING_REQ_STATE_WAITING) {
+		/* error code should not matter,
+		 * but better a code so that userspace
+		 * would abort if somehow still alive
+		 */
+
+		free_pages((unsigned long)req->kbuf,
+			   get_order(fc->ring.ring_req_size));
+
+		pr_debug("releasing cmd qid=%d tag=%d\n",
+			 qid, tag);
+		io_uring_cmd_done(req->cmd, -EIO, 0);
+	}
+}
+
 /**
- * XXX So far only happens on umount, but we need it on daemon exit.
- *     Create a waiting ioctl thread, which does this on exit?
+ *  Destruct the ring
  */
 void fuse_destroy_uring(struct fuse_conn *fc)
 {
-
 	spin_lock(&fc->ring.lock);
 	if (fc->ring.queues) {
-		int q_id, tag, state;
+		int qid, tag;
 		struct fuse_ring_req *req;
 		struct fuse_ring_queue *queue;
 
-		for (q_id = 0; q_id < fc->ring.nr_queues; q_id++) {
-			queue = &fc->ring.queues[q_id];
+		for (qid = 0; qid < fc->ring.nr_queues; qid++) {
+			queue = &fc->ring.queues[qid];
 			for (tag = 0; tag < fc->ring.queue_depth; tag++) {
 				req = &queue->ring_req[tag];
-				state = READ_ONCE(req->state);
-				pr_debug("qid=%d tag=%d state=%d\n",
-					 q_id, tag, state);
-
-				if (state == FUSE_RING_REQ_STATE_WAITING) {
-					/* error code should not matter,
-					 * but better a code so that userspace
-					 * would abort if somehow still alive
-					 */
-					pr_debug("releasing cmd qid=%d tag=%d\n",
-						 q_id, tag);
-					io_uring_cmd_done(req->cmd, -EIO, 0);
-				}
+				fuse_uring_free_req(fc, req, qid, tag);
 			}
 		}
 
@@ -470,6 +486,24 @@ void fuse_destroy_uring(struct fuse_conn *fc)
 }
 EXPORT_SYMBOL_GPL(fuse_destroy_uring);
 
+/**
+ * Fallback to stop uring resources if there is no thread from
+ * userspace doing that.
+ * Having a waiting userspace process if preferred, as this
+ * method requires interval monitoring and hence, repeating cpu resources.
+ */
+static void fuse_dev_ring_stop_monitor_fn(struct work_struct *work)
+{
+	struct fuse_conn *fc = container_of(work, struct fuse_conn,
+					      ring.stop_monitor.work);
+	struct fuse_iqueue *fiq = &fc->iq;
+
+	if ((fc->ring.daemon->flags & PF_EXITING) || !fiq->connected ||
+	    fc->ring.stop_requested)
+		fuse_destroy_uring(fc);
+}
+
+
 static int fuse_dev_create_uring_req_mem(struct fuse_ring_req *req, int size)
 {
 	const int flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | __GFP_NOWARN | __GFP_COMP;
@@ -478,24 +512,14 @@ static int fuse_dev_create_uring_req_mem(struct fuse_ring_req *req, int size)
 	return req->kbuf ? 0 : -ENOMEM;
 }
 
-int fuse_dev_setup_uring(struct file *file, struct fuse_uring_cfg *cfg)
+static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg)
 {
-	struct fuse_dev *fud = fuse_get_dev(file);
-	struct fuse_conn *fc;
 	size_t req_size;
 	size_t queue_size;
 	int q_id;
+	int rc;
 
-	if (fud == NULL)
-		return -ENODEV;
-
-	pr_debug("%s flags=%llx nq=%d  per-core=%d qdepth=%d\n",
-		 __func__, cfg->compat_flags, cfg->num_queues, cfg->per_core_queue,
-		 cfg->queue_depth);
-
-	fc = fud->fc;
-
-	if (cfg->per_core_queue) {
+	if (cfg->flags & FUSE_URING_IOCTL_FLAG_PER_CORE_QUEUE) {
 		if (!cpu_possible(cfg->num_queues - 1)) {
 			pr_info("per-core-queue, but number of queue "
 				"mismatches number of cpus");
@@ -516,16 +540,27 @@ int fuse_dev_setup_uring(struct file *file, struct fuse_uring_cfg *cfg)
 		return -EINVAL;
 	}
 
+	spin_lock(&fc->ring.lock);
+
+	if (fc->ring.initialized) {
+		rc = -EALREADY;
+		goto unlock;
+	}
+
+	INIT_DELAYED_WORK(&fc->ring.stop_monitor, fuse_dev_ring_stop_monitor_fn);
+	schedule_delayed_work(&fc->ring.stop_monitor, FURING_DAEMON_MON_PERIOD);
+
 	req_size = cfg->queue_depth * sizeof(struct fuse_ring_req);
 	queue_size = (sizeof(*fc->ring.queues) + req_size) * cfg->num_queues;
 
+	fc->ring.daemon = current;
 	fc->ring.nr_queues = cfg->num_queues;
 	fc->ring.queue_depth = cfg->queue_depth;
-	fc->ring.per_core_queue = cfg->per_core_queue;
+	fc->ring.per_core_queue = cfg->flags & FUSE_URING_IOCTL_FLAG_PER_CORE_QUEUE;
 	fc->ring.ring_req_size = cfg->mmap_req_size;
 	fc->ring.queues = kcalloc(cfg->num_queues, queue_size, GFP_KERNEL);
 	for (q_id = 0; q_id < cfg->num_queues; q_id++) {
-		int tag, rc;
+		int tag;
 		struct fuse_ring_queue *queue = &fc->ring.queues[q_id];
 		queue->q_id = q_id;
 		queue->fc = fc;
@@ -541,15 +576,100 @@ int fuse_dev_setup_uring(struct file *file, struct fuse_uring_cfg *cfg)
 
 			rc = fuse_dev_create_uring_req_mem(req, cfg->mmap_req_size);
 			if (rc != 0)
-				return rc; /* XXX free all memory */
+				goto unlock;
 
 			WRITE_ONCE(req->state, FUSE_RING_REQ_STATE_INIT);
 		}
 	}
 
+	fc->ring.initialized = 1;
+	rc = 0;
+
+unlock:
+	spin_unlock(&fc->ring.lock);
+	return rc;
+}
+
+/**
+ * Wait until uring shall be destructed and then release uring resources
+ */
+static int fuse_dev_uring_wait_destruct(struct fuse_conn *fc)
+{
+	struct fuse_iqueue *fiq = &fc->iq;
+
+	pr_debug("%s exiting=%d connected=%d stop-req=%d\n", __func__,
+		 fc->ring.daemon->flags & PF_EXITING, fiq->connected,
+		 fc->ring.stop_requested);
+
+	/* This userspace thread can stop uring on process stop, no need
+	 * for the interval worker
+	 */
+	mod_delayed_work(system_wq, &fc->ring.stop_monitor, -1UL);
+
+	wait_event_interruptible_exclusive(fc->ring.stop_waitq,
+					   !fiq->connected ||
+					   fc->ring.stop_requested ||
+					   (fc->ring.daemon->flags & PF_EXITING));
+
+	if ((fc->ring.daemon->flags & PF_EXITING) || !fiq->connected ||
+	    fc->ring.stop_requested)
+		fuse_destroy_uring(fc);
+	else {
+		/* The userspace task gets scheduled to back userspace, we need
+		 * the interval worker again.
+		 */
+		mod_delayed_work(system_wq, &fc->ring.stop_monitor,
+				 FURING_DAEMON_MON_PERIOD);
+	}
+
 	return 0;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_setup_uring);
+
+static int fuse_dev_wakeup_destruct_wait(struct fuse_conn *fc)
+{
+	fc->ring.stop_requested = 1;
+	wake_up(&fc->ring.stop_waitq);
+
+	return 0;
+}
+
+int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
+{
+	struct fuse_dev *fud = fuse_get_dev(file);
+	struct fuse_conn *fc;
+
+	if (fud == NULL)
+		return -ENODEV;
+
+	pr_debug("%s flags=%llx nq=%d  qdepth=%d\n",
+		 __func__, cfg->flags, cfg->num_queues, cfg->queue_depth);
+
+	fc = fud->fc;
+
+	if (cfg->flags & FUSE_URING_IOCTL_FLAG_CFG) {
+		/* config flag is incompatible to WAIT and STOP */
+		if ((cfg->flags & FUSE_URING_IOCTL_FLAG_WAIT) ||
+		    (cfg->flags & FUSE_URING_IOCTL_FLAG_STOP))
+			return -EINVAL;
+
+		return fuse_dev_uring_setup(fc, cfg);
+	}
+
+	if (cfg->flags & FUSE_URING_IOCTL_FLAG_WAIT) {
+		if (cfg->flags & FUSE_URING_IOCTL_FLAG_STOP)
+			return -EINVAL;
+
+		return fuse_dev_uring_wait_destruct(fc);
+	}
+
+	if (cfg->flags & FUSE_URING_IOCTL_FLAG_STOP) {
+		return fuse_dev_wakeup_destruct_wait(fc);
+	}
+
+	/* no command flag set */
+	return -EINVAL;
+}
+
 
 /**
  * This is mmap for userspace uring
