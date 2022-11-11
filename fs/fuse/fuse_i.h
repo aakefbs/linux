@@ -887,14 +887,37 @@ struct fuse_conn {
 	struct fuse_sync_bucket __rcu *curr_bucket;
 
 	/** queues for request handling via uring */
-	struct ring { /* XXX: Move to struct fuse_dev? */
+	struct fuse_ring { /* XXX: Move to struct fuse_dev? */
 		spinlock_t lock;
 		unsigned int max_io_sz;
 		size_t nr_queues;
 		size_t queue_depth;
 		size_t ring_req_size;
 		struct fuse_ring_queue *queues;
+
+		/* did the ring get initialized already ? */
+		int initialized:1;
+
+		/* one queue per core or a single queue only ? */
 		int per_core_queue:1;
+
+		/* userspace sent a stop ioctl */
+		int stop_requested:1;
+
+		/* userspace process */
+		struct task_struct *daemon;
+
+		/* userspace has a special thread that exists only to wait
+		 * in the kernel for process stop, to release uring
+		 */
+		wait_queue_head_t stop_waitq;
+
+		/* The daemon might might get killed and uring then needs
+		 * to be released without getting a umount notification, this
+		 * workqueue exists to release uring even without a process
+		 * being hold in the stop_waitq
+		 */
+		struct delayed_work stop_monitor;
 	} ring;
 };
 
