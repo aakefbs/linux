@@ -3354,7 +3354,7 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 		dput(dentry);
 		dentry = NULL;
 	}
-	if (dentry->d_inode) {
+	if (dentry->d_inode && !d_atomic_open(dentry)) {
 		/* Cached positive dentry: will open in f_op->open */
 		return dentry;
 	}
