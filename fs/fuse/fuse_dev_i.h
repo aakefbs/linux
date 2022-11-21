@@ -59,6 +59,8 @@ int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		  unsigned nbytes);
 
 void fuse_put_request(struct fuse_req *req);
+struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flags);
+
 
 
 #endif

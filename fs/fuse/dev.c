@@ -41,7 +41,7 @@ struct fuse_dev *fuse_get_dev(struct file *file)
 }
 EXPORT_SYMBOL_GPL(fuse_get_dev);
 
-static struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flags)
+struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flags)
 {
 	struct fuse_req *req = kmem_cache_zalloc(fuse_req_cachep, flags);
 	if (req)
@@ -49,13 +49,15 @@ static struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flag
 
 	return req;
 }
+EXPORT_SYMBOL_GPL(fuse_request_alloc_mem);
 
-static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags)
+static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags,
+					   bool for_background, bool no_uring)
 {
 	struct fuse_conn *fc = fm->fc;
 
-	if (fc->ring.nr_queues > 0)
-		return fuse_request_alloc_ring(fm);
+	if (fc->ring.nr_queues > 0 && !no_uring)
+		return fuse_request_alloc_ring(fm, flags, for_background);
 	else
 		return fuse_request_alloc_mem(fm, flags);
 }
@@ -103,7 +105,8 @@ static void fuse_drop_waiting(struct fuse_conn *fc)
 	}
 }
 
-static struct fuse_req *fuse_get_req(struct fuse_mount *fm, bool for_background)
+static struct fuse_req *fuse_get_req(struct fuse_mount *fm, bool for_background,
+				     bool no_uring)
 {
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_req *req;
@@ -127,7 +130,7 @@ static struct fuse_req *fuse_get_req(struct fuse_mount *fm, bool for_background)
 	if (fc->conn_error)
 		goto out;
 
-	req = fuse_request_alloc(fm, GFP_KERNEL);
+	req = fuse_request_alloc(fm, GFP_KERNEL, for_background, no_uring);
 	err = -ENOMEM;
 	if (!req) {
 		if (for_background)
@@ -208,7 +211,7 @@ static unsigned int fuse_req_hash(u64 unique)
 }
 
 /**
- * A new request is available, wake fiq->waitq
+ * A new request i6s available, wake fiq->waitq
  */
 static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq)
 __releases(fiq->lock)
@@ -230,31 +233,28 @@ static void queue_request_and_unlock(struct fuse_iqueue *fiq,
 				     struct fuse_req *req)
 __releases(fiq->lock)
 {
-	struct fuse_conn *fc = req->fm->fc;
-
 	req->in.h.len = sizeof(struct fuse_in_header) +
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 
 	pr_debug("%s:%d Here\n", __func__, __LINE__);
 
-	if (!fc->ring.nr_queues) {
-		pr_debug("List queuing request\n");
-		list_add_tail(&req->list, &fiq->pending);
-		fiq->ops->wake_pending_and_unlock(fiq);
-	}
-	else {
-		struct fuse_ring_req *ring_req;
-
-		ring_req = container_of(req, struct fuse_ring_req, req);
-
-		pr_debug("%s req=%p ring_req=%p &ring_req->req=%p",
-			 __func__, req, ring_req, &ring_req->req);
+	if (test_bit(FR_URING, &req->flags)) {
+		struct fuse_ring_req *ring_req =
+			container_of(req, struct fuse_ring_req, req);
 
 		/* this lock is not needed at all for ring req handling */
 		spin_unlock(&fiq->lock);
 
-		fuse_dev_uring_read(ring_req);
+		pr_debug("%s req=%p ring_req=%p &ring_req->req=%p",
+			 __func__, req, ring_req, &ring_req->req);
+
+		fuse_dev_uring_write_to_ring(ring_req);
+	} else {
+
+		pr_debug("List queuing request\n");
+		list_add_tail(&req->list, &fiq->pending);
+		fiq->ops->wake_pending_and_unlock(fiq);
 	}
 }
 
@@ -513,7 +513,8 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 
 	if (args->force) {
 		atomic_inc(&fc->num_waiting);
-		req = fuse_request_alloc(fm, GFP_KERNEL | __GFP_NOFAIL);
+		req = fuse_request_alloc(fm, GFP_KERNEL | __GFP_NOFAIL,
+					 false, false);
 
 		if (!args->nocreds)
 			fuse_force_creds(req);
@@ -522,7 +523,7 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 		__set_bit(FR_FORCE, &req->flags);
 	} else {
 		WARN_ON(args->nocreds);
-		req = fuse_get_req(fm, false);
+		req = fuse_get_req(fm, false, false);
 		if (IS_ERR(req))
 			return PTR_ERR(req);
 	}
@@ -544,6 +545,28 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 	return ret;
 }
 
+static void fuse_request_send_background_uring(struct fuse_conn *fc,
+					       struct fuse_req *req)
+{
+	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_ring_req *ring_req =
+		container_of(req, struct fuse_ring_req, req);
+
+#if 0
+	/* acquire extra reference, since request is still needed
+	   after fuse_request_end() */
+	__fuse_get_request(req);
+#endif
+
+	spin_lock(&fc->bg_lock);
+	fc->num_background++;
+	fc->active_background++;
+	spin_unlock(&fc->bg_lock);
+
+	req->in.h.unique = fuse_get_unique(fiq);
+	fuse_dev_uring_write_to_ring(ring_req);
+}
+
 static bool fuse_request_queue_background(struct fuse_req *req)
 {
 	struct fuse_mount *fm = req->fm;
@@ -551,6 +574,12 @@ static bool fuse_request_queue_background(struct fuse_req *req)
 	bool queued = false;
 
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
+
+	if (test_bit(FR_URING, &req->flags)) {
+		fuse_request_send_background_uring(fc, req);
+		return true;
+	}
+
 	if (!test_bit(FR_WAITING, &req->flags)) {
 		__set_bit(FR_WAITING, &req->flags);
 		atomic_inc(&fc->num_waiting);
@@ -577,13 +606,13 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 
 	if (args->force) {
 		WARN_ON(!args->nocreds);
-		req = fuse_request_alloc(fm, gfp_flags);
+		req = fuse_request_alloc(fm, gfp_flags, true, false);
 		if (!req)
 			return -ENOMEM;
 		__set_bit(FR_BACKGROUND, &req->flags);
 	} else {
 		WARN_ON(args->nocreds);
-		req = fuse_get_req(fm, true);
+		req = fuse_get_req(fm, true, false);
 		if (IS_ERR(req))
 			return PTR_ERR(req);
 	}
@@ -606,7 +635,7 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 	struct fuse_iqueue *fiq = &fm->fc->iq;
 	int err = 0;
 
-	req = fuse_get_req(fm, false);
+	req = fuse_get_req(fm, false, true);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
