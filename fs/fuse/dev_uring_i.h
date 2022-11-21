@@ -11,14 +11,15 @@
 
 #include "fuse_i.h"
 
-int fuse_dev_uring_read(struct fuse_ring_req *ring_req);
-void fuse_dev_uring_write(struct fuse_dev *fud,
+int fuse_dev_uring_write_to_ring(struct fuse_ring_req *ring_req);
+void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
 			  struct fuse_ring_req *ring_req);
 
 void fuse_destroy_uring(struct fuse_conn *fc);
 int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg);
 
-struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm);
+struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
+					 bool for_background);
 
 int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags);
 int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma);

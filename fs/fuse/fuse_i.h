@@ -328,6 +328,7 @@ enum fuse_req_flag {
 	FR_FINISHED,
 	FR_PRIVATE,
 	FR_ASYNC,
+	FR_URING,
 };
 
 /**
@@ -544,7 +545,7 @@ struct fuse_ring_req {
 
 	int tag;
 
-	/* back pointer */
+	/* back pointer XXX: Back pointer to queue, queue then to fc*/
 	struct fuse_conn *fc;
 
 	/* set from uring sqe */
@@ -560,22 +561,24 @@ struct fuse_ring_req {
 	struct io_uring_cmd *cmd;
 };
 
+/* XXX Is there a uring macro for this? */
+#define FUSE_URING_MAX_QUEUE_DEPTH 65535
+
 struct fuse_ring_queue {
 	// int q_id;
 
 	unsigned long flags;
-	// struct task_struct	*fuse_daemon;
-	// char *io_cmd_buf;
-
-	// unsigned long io_addr;	/* mapped vm address */
-	// bool abort_work_pending;
-	// unsigned short nr_io_ready;	/* how many ios setup */
 
 	struct fuse_conn *fc;
 
 	int q_id;
 
-	atomic_t req_cnt;
+	/* available requests in this queue */
+	s16 n_req_avail;
+	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
+
+	/** waiting tasks that did not get a ring slot */
+	wait_queue_head_t waitq;
 
 	/* size depends on queue depth */
 	struct fuse_ring_req ring_req[];
