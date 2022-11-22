@@ -51,6 +51,10 @@ struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flags)
 }
 EXPORT_SYMBOL_GPL(fuse_request_alloc_mem);
 
+/**
+ *
+ * @param no_uring is temporary, until notify has uring support
+ */
 static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags,
 					   bool for_background, bool no_uring)
 {
