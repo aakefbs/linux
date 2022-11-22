@@ -548,15 +548,12 @@ struct fuse_ring_req {
 	/* back pointer XXX: Back pointer to queue, queue then to fc*/
 	struct fuse_conn *fc;
 
-	/* set from uring sqe */
-	struct fuse_uring_buf_req *user_ptr;
-	size_t addr_len;
-
 	/* XXX CAS all states */
 	enum fuse_ring_req_state state;
 	// int res;
 
 	struct fuse_req req;
+	struct fuse_req *req_ptr; /* when a list request is handled */
 
 	struct io_uring_cmd *cmd;
 };
@@ -573,9 +570,13 @@ struct fuse_ring_queue {
 
 	int q_id;
 
-	/* available requests in this queue */
-	s16 n_req_avail;
 	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
+
+	/** current number of foreground requests */
+	u16 req_avtive_foreground;
+
+	/** current number of background entries */
+	u16 req_active_background;
 
 	/** waiting tasks that did not get a ring slot */
 	wait_queue_head_t waitq;
@@ -891,11 +892,24 @@ struct fuse_conn {
 
 	/** queues for request handling via uring */
 	struct fuse_ring { /* XXX: Move to struct fuse_dev? */
+
 		spinlock_t lock;
-		unsigned int max_io_sz;
+
+		/* number of ring queues */
 		size_t nr_queues;
+
+		/* number of entries per queue */
 		size_t queue_depth;
+
+		/* req buffer size */
 		size_t ring_req_size;
+
+		/* max number of background requests per queue */
+		size_t max_background;
+
+		/* max number of foreground requests */
+		size_t max_foreground;
+
 		struct fuse_ring_queue *queues;
 		size_t queue_size;
 
