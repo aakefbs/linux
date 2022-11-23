@@ -230,6 +230,23 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 
 		fm = get_fuse_mount(inode);
 
+		/* If open atomic is supported by FUSE then use this opportunity
+		 * to avoid this lookup and combine lookup + open into a single call.
+		 *
+		 * Note: Fuse detects open atomic implementation automatically.
+		 * Therefore first few call would go into open atomic code path
+		 * , detects that open atomic is implemented or not by setting
+		 * fc->no_open_atomic. In case open atomic is not implemented,
+		 * calls fall back to non-atomic open.
+		 */
+		if (!fm->fc->no_open_atomic && flags & LOOKUP_OPEN) {
+			spin_lock(&entry->d_lock);
+			entry->d_flags |= DCACHE_ATOMIC_OPEN;
+			spin_unlock(&entry->d_lock);
+
+			ret = 1;
+			goto out;
+		}
 		forget = fuse_alloc_forget();
 		ret = -ENOMEM;
 		if (!forget)
@@ -770,13 +787,116 @@ no_open:
 	return finish_no_open(file, res);
 }
 
+/**
+ * Revalidate inode hooked into dentry against freshly acquired
+ * attributes. If inode is stale then allocate new dentry and
+ * hook it onto fresh inode.
+ */
+static struct dentry *fuse_open_atomic_revalidate(
+					struct fuse_conn *fc,
+					struct dentry *entry,
+					struct fuse_entry_out *outentry,
+					wait_queue_head_t *wq,
+					int *alloc_inode)
+{
+	bool alloc_dentry = false;
+	char *dname = NULL;
+	u64 attr_version;
+	struct dentry *new = NULL;
+	struct dentry *parent = NULL;
+	struct inode *inode = NULL;
+	struct qstr name;
+
+	if (alloc_inode)
+		*alloc_inode = false;
+
+	if (d_really_is_positive(entry)) {
+		inode = d_inode(entry);
+		if (outentry->nodeid != get_node_id(inode) ||
+		    (bool) IS_AUTOMOUNT(inode) !=
+		    (bool) (outentry->attr.flags & FUSE_ATTR_SUBMOUNT)) {
+			alloc_dentry = true;
+			if (alloc_inode)
+				*alloc_inode = true;
+		}
+		else if (fuse_stale_inode(inode, outentry->generation,
+			 &outentry->attr)) {
+			fuse_make_bad(inode);
+			alloc_dentry = true;
+			if (alloc_inode)
+				*alloc_inode = true;
+		}
+
+		if (alloc_dentry) {
+			parent = entry->d_parent;
+
+			/* Allocate memory to temporarly hold dentry name as we
+			 * copy name to new dentry. Can we safely use existing dentry
+			 * for name copy?
+			 */
+			dname = kmalloc(entry->d_name.len,
+					GFP_KERNEL_ACCOUNT |
+					__GFP_RECLAIMABLE);
+			if (!dname)
+				return ERR_PTR(-ENOMEM);
+
+			memcpy(dname, entry->d_name.name, entry->d_name.len);
+			dname[entry->d_name.len] = 0;
+			name.name = dname;
+			name.len = entry->d_name.len;
+
+			/* Invalidate old dentry and allocate new one */
+			d_invalidate(entry);
+			new = d_alloc_parallel(parent, &name, wq);
+
+			printk(KERN_ERR"Fname=%s Need to wakeup threads on new@%p ndflags=%d entry@%p", new->d_name.name, new, new->d_flags, entry);
+
+			/* Free dname */
+			kfree(dname);
+
+			if (IS_ERR(new)) {
+				return new;
+			}
+			entry = new;
+		} else {
+			/* Unset DCACHE_ATOMIC_OPEN flag from the dentry. In
+			 * fuse_dentry_revalidate(), we set this flag on this dentry to
+			 * avoid lookup. For non-expired dentries we do not enter atomic
+			 * open, and open is done by VFS itself. We come here for expired
+			 * entries(for positive dentries) because such a dentry does lookup
+			 * and it is what we we optimized by mentioned flag.
+			 */
+			spin_lock(&entry->d_lock);
+			entry->d_flags &= ~DCACHE_ATOMIC_OPEN;
+			spin_unlock(&entry->d_lock);
+
+			attr_version = fuse_get_attr_version(fc);
+			forget_all_cached_acls(inode);
+			fuse_change_attributes(inode, &outentry->attr,
+					       entry_attr_timeout(outentry),
+					       attr_version);
+		}
+	} else {
+		if (alloc_inode)
+			*alloc_inode = true;
+	}
+	return entry;
+}
+
+/**
+ * Does 'lookup + create + open' or 'lookup + open' atomically.
+ * @entry might be positive as well, therefore inode is re-validated.
+ * Positive dentry is invalidated in case inode attributes differ or
+ * we encountered error.
+ */
 static int fuse_open_atomic(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned flags,
 			    umode_t mode)
 {
 
 	int err;
-	struct inode *inode;
+	struct inode *inode = d_inode(entry);
+	struct inode *tmpi = inode;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	struct fuse_conn *fc = fm->fc;
 	FUSE_ARGS(args);
@@ -787,7 +907,17 @@ static int fuse_open_atomic(struct inode *dir, struct dentry *entry,
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
 	struct dentry *res = NULL;
+	struct dentry *new = NULL;
+	struct dentry *tmp = entry;
 	struct fuse_in_arg sec_in_args = { .size = 0, .value = NULL };
+	int alloc_inode;
+	bool instantiate = true;
+	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+	bool IsPositive = d_really_is_positive(entry) ? 1 : 0;
+	bool switched = false;
+
+	printk(KERN_ERR"Atomic Open1: File name=%s entry@%p d_flags=0x%x Flags=0x%x IsPositive=%d inode@%p",
+		entry->d_name.name, entry, entry->d_flags, flags, IsPositive, inode);
 
 	/* Userspace expects S_IFREG in create mode */
 	if ((flags & O_CREAT) && (mode & S_IFMT) != S_IFREG) {
@@ -844,34 +974,65 @@ static int fuse_open_atomic(struct inode *dir, struct dentry *entry,
 	}
 
 	err = fuse_simple_request(fm, &args);
-	if (err == -ENOSYS) {
-		fc->no_open_atomic = 1;
-		fuse_file_free(ff);
-		kfree(forget);
-		goto fallback;
-	}
 	if (err) {
-		if (err == -ENOENT)
-			fuse_invalidate_entry_cache(entry);
-		goto out_free_ff;
+		if (err == -ENOSYS) {
+			fc->no_open_atomic = 1;
+			fuse_file_free(ff);
+			kfree(forget);
+			goto out_nonatomic;
+		} else {
+			if (err == -ENOENT)
+				fuse_invalidate_entry_cache(entry);
+			else if (d_really_is_positive(entry))
+				d_invalidate(entry);
+			goto out_free_ff;
+		}
 	}
+
+	err = -ENOENT;
+	if (!outentry.nodeid)
+		goto out_free_ff;
 
 	err = -EIO;
 	if (invalid_nodeid(outentry.nodeid) || fuse_invalid_attr(&outentry.attr))
 		goto out_free_ff;
 
+	err = -ESTALE;
+	new = fuse_open_atomic_revalidate(fm->fc, entry, &outentry, &wq,
+					  &alloc_inode);
+	if (IS_ERR(new))
+		goto out_free_ff;
+
+	if (new != entry)
+		switched = true;
+
+	/* Old dentry is valid and positive */
+	if (entry == new && d_really_is_positive(entry))
+		instantiate = false;
+
+	entry = new;
+#if 0
+	/* If new dentry has become positive in mean time*/
+	if (!d_in_lookup(entry) && d_really_is_positive(entry))
+		instantiate = false;
+#endif
 	ff->fh = outopen.fh;
 	ff->nodeid = outentry.nodeid;
 	ff->open_flags = outopen.open_flags;
-	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
-			  &outentry.attr, entry_attr_timeout(&outentry), 0);
-	if (!inode) {
-		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
-		fuse_sync_release(NULL, ff, flags);
-		fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
-		err = -ENOMEM;
-		goto out_err;
+
+	if (alloc_inode) {
+
+		inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
+				  &outentry.attr, entry_attr_timeout(&outentry), 0);
+		if (!inode) {
+			flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+			fuse_sync_release(NULL, ff, flags);
+			fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
+			err = -ENOMEM;
+			goto out_err;
+		}
 	}
+
 	if (d_in_lookup(entry)) {
 		res = d_splice_alias(inode, entry);
 		if (res) {
@@ -889,10 +1050,23 @@ static int fuse_open_atomic(struct inode *dir, struct dentry *entry,
 			}
 			entry = res;
 		}
-	} else
+		printk(KERN_ERR"Fname:%s Wakeup all waiters on entry@%p oentry@%p inode@%p tmpi@%p alloc_i=%d",
+				entry->d_name.name, entry, tmp, inode, tmpi, alloc_inode);
+		//d_lookup_done(entry);
+		printk(KERN_ERR"Wakeup done:Fname=%s entry@%p oentry@%p inode@%p tmpi@%p alloc_i=%d"
+				,entry->d_name.name, entry, tmp, inode, tmpi, alloc_inode);
+	} else if (instantiate && !d_really_is_positive(entry)) {
+		printk(KERN_ERR"Fname:%s Instantiate start entry@%p npositive=%d oentry@%p inode@%p tmpi@%p alloc_i=%d",
+			entry->d_name.name, entry, d_really_is_positive(entry), tmp, inode, tmpi, alloc_inode);
 		d_instantiate(entry, inode);
+		printk(KERN_ERR"Fname=%s Instantiate done entry@%p npositive=%d oentry@%p ino@%p tmpi@%p alloc_i=%d",
+			entry->d_name.name, entry, d_really_is_positive(entry), tmp, inode, tmpi, alloc_inode);
+
+	}
 	fuse_change_entry_timeout(entry, &outentry);
+
 	/* This should be always set when the file is created */
+	/*  File was indeed created */
 	if (outopen.open_flags & FOPEN_FILE_CREATED) {
 		fuse_dir_changed(dir);
 		file->f_mode |= FMODE_CREATED;
@@ -909,8 +1083,16 @@ static int fuse_open_atomic(struct inode *dir, struct dentry *entry,
 		file->private_data = ff;
 		fuse_finish_open(inode, file);
 	}
+	printk(KERN_ERR"Atomic Open2: Fname=%s entry@%p new@%p old@%p res@%p WPos=%d d_fl=0x%x fl=0x%x alloc_i=%d inst=%d ino@%p tmpi@%p alloc_i=%d",
+		entry->d_name.name, entry, new, tmp, res, IsPositive, entry->d_flags, flags, alloc_inode, instantiate, inode, tmpi, alloc_inode);
+
 	kfree(forget);
 	dput(res);
+	/* New dentry was allocated, drop extra ref taken in do_dentry_open().
+	 * One more ref would be taken by VFS just after returning from here.
+	 */
+	if (switched)
+		dput(entry);
 	return err;
 
 out_free_ff:
