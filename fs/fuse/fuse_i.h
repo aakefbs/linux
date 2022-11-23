@@ -534,7 +534,6 @@ enum fuse_ring_req_state {
 	FUSE_RING_REQ_STATE_INIT   = 0,
 	FUSE_RING_REQ_STATE_WAITING, /* waiting for application requests */
 	FUSE_RING_REQ_STATE_REQ, /* processing a requst */
-	FUSE_RING_REQ_STATE_COMMIT,  /* active in the kernel, committing data */
 	FUSE_RING_REQ_STATE_USERSPACE
 };
 
@@ -545,12 +544,9 @@ struct fuse_ring_req {
 
 	int tag;
 
-	/* back pointer XXX: Back pointer to queue, queue then to fc*/
-	struct fuse_conn *fc;
+	struct fuse_ring_queue *queue;
 
-	/* XXX CAS all states */
 	enum fuse_ring_req_state state;
-	// int res;
 
 	struct fuse_req req;
 	struct fuse_req *req_ptr; /* when a list request is handled */

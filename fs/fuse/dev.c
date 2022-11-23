@@ -183,8 +183,9 @@ void fuse_put_request(struct fuse_req *req)
 			fuse_drop_waiting(fc);
 		}
 
-		/* no need to free if the request belongs to a ring queue */
-		if (!fc->ring.queue_depth)
+		if (test_bit(FR_URING, &req->flags))
+			fuse_dev_uring_req_release(req);
+		else
 			fuse_request_free(req);
 	}
 }
