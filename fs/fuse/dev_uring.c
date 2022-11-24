@@ -670,7 +670,6 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 	return -EINVAL;
 }
 
-
 /**
  * This is mmap for userspace uring
  */
@@ -680,7 +679,8 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct fuse_conn *fc = fud->fc;
 	size_t sz = vma->vm_end - vma->vm_start;
 	phys_addr_t pfn;
-	int qid, tag, ret = 0;
+	unsigned qid, tag;
+	int ret;
 	loff_t off;
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_req *req;
@@ -692,13 +692,17 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 		goto out;
 	}
 
-	/* offset actually has the specifies which ring request the mmap is for */
-	off = vma->vm_pgoff << PAGE_SHIFT;
-	qid = off / fc->ring.nr_queues;
-	tag = off % fc->ring.queue_depth;
-
-	if (qid > fc->ring.nr_queues)
-		return -EINVAL;
+	/* offset actually has the specifies which ring request the mmap is for
+	 * additional PAGE_SIZE division is done as offset has to be page
+	 * aligned, so actual values had been multiplied by PAGE_SIZE by the
+	 * mmap requesting side */
+	off = (vma->vm_pgoff << PAGE_SHIFT) / PAGE_SIZE;
+	qid = off / (fc->ring.queue_depth);
+	tag = off % (fc->ring.queue_depth);
+	if (qid + 1 > fc->ring.nr_queues || tag + 1 > fc->ring.queue_depth) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	queue = &fc->ring.queues[qid];
 	req = &queue->ring_req[tag];
@@ -707,8 +711,9 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	ret = remap_pfn_range(vma, vma->vm_start, pfn, sz, vma->vm_page_prot);
 
 out:
-	pr_debug("%s: pid %d addr %lx sz %zu qid: %d tag: %d ret %d\n",
-		 __func__, current->pid, vma->vm_start, sz, qid, tag, ret);
+	pr_debug("%s: pid %d req=%p addr %p sz %zu qid: %d tag: %d ret %d\n",
+		 __func__, current->pid, req, (char *)vma->vm_start,
+		 sz, qid, tag, ret);
 
 	return ret;
 }
