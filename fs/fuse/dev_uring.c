@@ -650,12 +650,15 @@ static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg
 			req->fc = fc;
 			req->tag = tag;
 
-			pr_debug("initialize qid=%d tag=%d queue=%p req=%p",
-				 q_id, tag, queue, req);
 
 			rc = fuse_dev_create_uring_req_mem(req, cfg->mmap_req_size);
+
+			pr_debug("initialize qid=%d tag=%d queue=%p req=%p kbuf=%p",
+				 q_id, tag, queue, req, req->kbuf);
+
 			if (rc != 0)
 				goto unlock;
+
 
 			WRITE_ONCE(req->state, FUSE_RING_REQ_STATE_INIT);
 		}
