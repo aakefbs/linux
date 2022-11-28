@@ -897,6 +897,7 @@ struct fuse_conn {
 		size_t queue_depth;
 		size_t ring_req_size;
 		struct fuse_ring_queue *queues;
+		size_t queue_size;
 
 		/* did the ring get initialized already ? */
 		int initialized:1;
