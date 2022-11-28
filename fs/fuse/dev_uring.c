@@ -31,6 +31,13 @@
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
 
 
+static struct fuse_ring_queue *
+fuse_uring_get_queue(struct fuse_conn *fc, int qid)
+{
+	char *ptr = (char *)fc->ring.queues;
+	return (struct fuse_ring_queue *)(ptr + qid * fc->ring.queue_size);
+}
+
 static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
 				   struct fuse_req *req,
 				   struct fuse_uring_buf_req *buf_req)
@@ -322,7 +329,7 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc)
 		core = 0;
 	}
 
-	return &fc->ring.queues[core];
+	return fuse_uring_get_queue(fc, core);
 }
 
 /**
@@ -417,7 +424,7 @@ int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
 			cmd_req->q_id, fc->ring.nr_queues);
 		goto out;
 	}
-	queue = &fc->ring.queues[cmd_req->q_id];
+	queue = fuse_uring_get_queue(fc, cmd_req->q_id);
 
 	if (cmd_req->tag > fc->ring.queue_depth) {
 		pr_info("tag=%u > queue-depth=%zu\n",
@@ -534,7 +541,7 @@ void fuse_destroy_uring(struct fuse_conn *fc)
 		struct fuse_ring_queue *queue;
 
 		for (qid = 0; qid < fc->ring.nr_queues; qid++) {
-			queue = &fc->ring.queues[qid];
+			queue = fuse_uring_get_queue(fc, qid);
 			for (tag = 0; tag < fc->ring.queue_depth; tag++) {
 				req = &queue->ring_req[tag];
 				fuse_uring_free_req(fc, req, qid, tag);
@@ -623,9 +630,15 @@ static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg
 	fc->ring.per_core_queue = cfg->flags & FUSE_URING_IOCTL_FLAG_PER_CORE_QUEUE;
 	fc->ring.ring_req_size = cfg->mmap_req_size;
 	fc->ring.queues = kcalloc(cfg->num_queues, queue_size, GFP_KERNEL);
+	if (!fc->ring.queues) {
+		rc = -ENOMEM;
+		goto unlock;
+	}
+	fc->ring.queue_size = queue_size;
+
 	for (q_id = 0; q_id < cfg->num_queues; q_id++) {
 		int tag;
-		struct fuse_ring_queue *queue = &fc->ring.queues[q_id];
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(fc, q_id);
 		queue->q_id = q_id;
 		queue->fc = fc;
 		queue->n_req_avail = 0;
@@ -751,7 +764,7 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_req *req;
 
-	 /* check if uring is configured and if the requested size matches */
+	/* check if uring is configured and if the requested size matches */
 	if (fc->ring.nr_queues == 0 || fc->ring.queue_depth == 0 ||
 	    sz != fc->ring.ring_req_size) {
 		ret = -EINVAL;
@@ -770,12 +783,11 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 		goto out;
 	}
 
-	queue = &fc->ring.queues[qid];
+	queue = fuse_uring_get_queue(fc, qid);
 	req = &queue->ring_req[tag];
 
 	pfn = virt_to_phys(req->kbuf) >> PAGE_SHIFT;
 	ret = remap_pfn_range(vma, vma->vm_start, pfn, sz, vma->vm_page_prot);
-
 out:
 	pr_debug("%s: pid %d req=%p addr %p sz %zu qid: %d tag: %d ret %d\n",
 		 __func__, current->pid, req, (char *)vma->vm_start,
