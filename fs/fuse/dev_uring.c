@@ -272,9 +272,6 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 
 	WRITE_ONCE(ring_req->state, FUSE_RING_REQ_STATE_REQ);
 
-	/* This should have a single request at startup only
-	 * XXX Double check and optimize away.
-	 */
 	spin_lock(&fiq->lock);
 	if (!list_empty(&fiq->pending)) {
 		q_req = list_entry(fiq->pending.next, struct fuse_req, list);
@@ -283,10 +280,12 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 	}
 	spin_unlock(&fiq->lock);
 
-	if (!q_req == 0)
+	if (!q_req)
 		goto out;
 
-	/* copy over and release the list-queued object */
+	/* copy over into the ring and store the initial request, once
+	 * the ring work is done copy back to the initial request will be done
+	 */
 	ring_req->req = *q_req;
 	fuse_put_request(q_req);
 
@@ -481,7 +480,7 @@ out:
 		ring_req->state = FUSE_RING_REQ_STATE_WAITING;
 		queue->n_req_avail++;
 		__set_bit(cmd_req->tag, queue->req_avail_map);
-		wake_up(&queue->waitq);
+		wake_up_locked(&queue->waitq);
 	} else {
 		/* the request already got handled */
 	}
