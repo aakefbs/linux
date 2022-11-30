@@ -284,7 +284,7 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 		goto out;
 
 	/* copy over into the ring and store the initial request, once
-	 * the ring work is done copy back to the initial request will be done
+	 * the ring work is done, copy back to the stored request will be done
 	 */
 	ring_req->req = *q_req;
 	fuse_put_request(q_req);
@@ -370,6 +370,8 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 
 			ring_req->state = FUSE_RING_REQ_STATE_REQ;
 			queue->n_req_avail--;
+			pr_debug("%s:%d queue=%p avail: %d\n", __func__, __LINE__,
+				 queue, queue->n_req_avail);
 			req = &ring_req->req;
 			__clear_bit(tag, queue->req_avail_map);
 		} else if (for_background) {
@@ -384,7 +386,7 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 			    (current->flags & PF_EXITING))
 				goto err;
 		}
-	} while (1);
+	} while (!req);
 	spin_unlock(&queue->waitq.lock);
 
 	memset(req, 0, sizeof(*req));
@@ -432,8 +434,9 @@ int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	}
 	ring_req = &queue->ring_req[cmd_req->tag];
 
-	pr_info("%s: received: cmd op %d queue %d (%p) tag %d  (%p)\n",
-		 __func__, cmd_op, cmd_req->q_id, queue, cmd_req->tag, ring_req);
+	pr_debug("%s:%d received: cmd op %d queue %d (%p) tag %d  (%p)\n",
+		 __func__, __LINE__,
+		 cmd_op, cmd_req->q_id, queue, cmd_req->tag, ring_req);
 
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
@@ -480,6 +483,9 @@ out:
 		ring_req->state = FUSE_RING_REQ_STATE_WAITING;
 		queue->n_req_avail++;
 		__set_bit(cmd_req->tag, queue->req_avail_map);
+		pr_debug("%s:%d queue=%p avail: %d\n", __func__, __LINE__,
+			 queue, queue->n_req_avail);
+
 		wake_up_locked(&queue->waitq);
 	} else {
 		/* the request already got handled */
