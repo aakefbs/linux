@@ -26,6 +26,7 @@
 #include <linux/mm.h>
 #include <asm/io.h>
 #include <linux/io_uring.h>
+#include <linux/topology.h>
 
 /* default monitor interval for a dying daemon */
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
@@ -342,6 +343,7 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc)
 {
 	unsigned int core = 0;
 
+	/* XXX 	Use raw_smp_processor_id()? */
 	if (fc->ring.per_core_queue)
 		core = task_cpu(current);
 
@@ -462,7 +464,7 @@ bool fuse_uring_free_req(struct fuse_conn *fc, struct fuse_ring_queue *queue,
 	spin_unlock(&queue->waitq.lock);
 
 	if (can_free) {
-		kvfree(req->kbuf);
+		vfree(req->kbuf);
 
 		pr_debug("releasing cmd qid=%d tag=%d\n", queue->q_id, req->tag);
 		io_uring_cmd_done(req->cmd, -EIO, 0);
@@ -713,12 +715,21 @@ static void fuse_dev_ring_stop_monitor_fn(struct work_struct *work)
 }
 
 /**
- * XXX Use __vmalloc and switch mmap to vmalloc
+ * XXX Add the qid (core number) and use __vmalloc_node_range() (needs to be
+ * exported?) or add a new (exported) function vm_alloc_user_node()
  */
-static int fuse_dev_create_uring_req_mem(struct fuse_ring_req *req, int size)
+static int fuse_dev_create_uring_req_mem(struct fuse_ring_req *req, int qid,
+					 int size)
 {
-	const int flags = GFP_KERNEL_ACCOUNT | __GFP_ZERO | __GFP_NOWARN | __GFP_COMP;
-	req->kbuf = (void *)__get_free_pages(flags, get_order(size));
+	int node = cpu_to_node(qid);
+
+	/*
+	 * XXX Add the qid (core number) and use __vmalloc_node_range()
+	 * (needs to be exported?) or add a new (exported) vm_alloc_user_node()
+	*/
+	(void)node;
+
+	req->kbuf = vmalloc_user(size);
 
 	return req->kbuf ? 0 : -ENOMEM;
 }
@@ -802,7 +813,8 @@ static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg
 			req->req_ptr = NULL;
 
 
-			rc = fuse_dev_create_uring_req_mem(req, cfg->mmap_req_size);
+			rc = fuse_dev_create_uring_req_mem(req, q_id,
+							   cfg->mmap_req_size);
 
 			pr_debug("initialize qid=%d tag=%d queue=%p req=%p kbuf=%p",
 				 q_id, tag, queue, req, req->kbuf);
@@ -912,7 +924,6 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct fuse_dev *fud = fuse_get_dev(filp);
 	struct fuse_conn *fc = fud->fc;
 	size_t sz = vma->vm_end - vma->vm_start;
-	phys_addr_t pfn;
 	unsigned qid, tag;
 	int ret;
 	loff_t off;
@@ -941,8 +952,7 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	queue = fuse_uring_get_queue(fc, qid);
 	req = &queue->ring_req[tag];
 
-	pfn = virt_to_phys(req->kbuf) >> PAGE_SHIFT;
-	ret = remap_pfn_range(vma, vma->vm_start, pfn, sz, vma->vm_page_prot);
+	ret = remap_vmalloc_range(vma, req->kbuf, 0);
 out:
 	pr_debug("%s: pid %d req=%p addr %p sz %zu qid: %d tag: %d ret %d\n",
 		 __func__, current->pid, req, (char *)vma->vm_start,
