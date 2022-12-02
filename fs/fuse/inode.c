@@ -850,7 +850,6 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->user_ns = get_user_ns(user_ns);
 	fc->max_pages = FUSE_DEFAULT_MAX_PAGES_PER_REQ;
 	fc->max_pages_limit = FUSE_MAX_MAX_PAGES;
-	spin_lock_init(&fc->ring.lock);
 	init_waitqueue_head(&fc->ring.stop_waitq);
 
 	INIT_LIST_HEAD(&fc->mounts);
