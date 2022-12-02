@@ -2285,7 +2285,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->lock);
 	}
 
-	fuse_destroy_uring(fc);
+	fuse_uring_start_destruct(fc);
 }
 EXPORT_SYMBOL_GPL(fuse_abort_conn);
 

@@ -531,10 +531,20 @@ struct fuse_sync_bucket {
 };
 
 enum fuse_ring_req_state {
+	/* request is not initialized */
 	FUSE_RING_REQ_STATE_INIT   = 0,
-	FUSE_RING_REQ_STATE_WAITING, /* waiting for application requests */
-	FUSE_RING_REQ_STATE_REQ, /* processing a requst */
-	FUSE_RING_REQ_STATE_USERSPACE
+
+	/* request is waiting for work */
+	FUSE_RING_REQ_STATE_WAITING,
+
+	/* request is processing data */
+	FUSE_RING_REQ_STATE_REQ,
+
+	/* request is in or on the way to userspace */
+	FUSE_RING_REQ_STATE_USERSPACE,
+
+	/* request is released */
+	FUSE_RING_REQ_STATE_FREED,
 };
 
 struct fuse_ring_req {
@@ -892,8 +902,6 @@ struct fuse_conn {
 	/** queues for request handling via uring */
 	struct fuse_ring { /* XXX: Move to struct fuse_dev? */
 
-		spinlock_t lock;
-
 		/* number of ring queues */
 		size_t nr_queues;
 
@@ -909,8 +917,14 @@ struct fuse_conn {
 		/* max number of foreground requests */
 		size_t max_foreground;
 
+		/* Hold ring requests */
 		struct fuse_ring_queue *queues;
+
+		/* number of entries per queue */
 		size_t queue_size;
+
+		/* When zero the queue can be freed on destruction */
+		int queue_refs;
 
 		/* did the ring get initialized already ? */
 		int initialized:1;
@@ -926,6 +940,7 @@ struct fuse_conn {
 
 		/* userspace has a special thread that exists only to wait
 		 * in the kernel for process stop, to release uring
+		 * The waitq lock is also used for ring setup and destruct
 		 */
 		wait_queue_head_t stop_waitq;
 

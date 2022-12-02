@@ -15,7 +15,7 @@ int fuse_dev_uring_write_to_ring(struct fuse_ring_req *ring_req);
 void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
 			  struct fuse_ring_req *ring_req);
 
-void fuse_destroy_uring(struct fuse_conn *fc);
+void fuse_uring_start_destruct(struct fuse_conn *fc);
 int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg);
 
 struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
