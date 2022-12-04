@@ -579,7 +579,7 @@ struct fuse_ring_queue {
 	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
 
 	/** current number of foreground requests */
-	u16 req_avtive_foreground;
+	u16 req_active_foreground;
 
 	/** current number of background entries */
 	u16 req_active_background;

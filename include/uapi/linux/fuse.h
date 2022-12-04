@@ -1084,8 +1084,8 @@ enum fuse_ring_req_cmd {
 };
 
 /* background request type. Might be used by user space to handle the request
- * with a lower priority */
-#define FUSE_RING_REQ_FLAG_BACKGROUND 1 << 0
+ * with a lower priority  */
+#define FUSE_RING_REQ_FLAG_BACKGROUND 1ull << 0
 
 /**
  * This structure mapped onto the
