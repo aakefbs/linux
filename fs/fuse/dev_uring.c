@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -32,7 +33,7 @@
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
 
 
-void fuse_uring_check_ring_destruct_destruct(struct fuse_conn *fc);
+void fuse_uring_check_ring_destruct(struct fuse_conn *fc);
 
 static struct fuse_ring_queue *
 fuse_uring_get_queue(struct fuse_conn *fc, int qid)
@@ -147,6 +148,10 @@ err:
 		*ring_req->req_ptr = *req;
 		fuse_request_end(ring_req->req_ptr);
 		ring_req->req_ptr = NULL;
+
+		/* release the ring req, as if it has done work */
+		WRITE_ONCE(ring_req->state, FUSE_RING_REQ_STATE_USERSPACE);
+		fuse_dev_uring_req_release(&ring_req->req);
 	}
 	else
 		fuse_request_end(req);
@@ -261,6 +266,9 @@ out:
 		*ring_req->req_ptr = *req;
 		fuse_request_end(ring_req->req_ptr);
 		ring_req->req_ptr = NULL;
+
+		/* the ring req is available now */
+		fuse_dev_uring_req_release(&ring_req->req);
 	}
 	else
 		fuse_request_end(&ring_req->req);
@@ -313,8 +321,8 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 	ring_req->req = *q_req;
 	ring_req->req_ptr = q_req;
 
-	pr_debug("%s: args=%p ring-args=%p\n",
-		 __func__, q_req->args, ring_req->req.args);
+	pr_debug("%s: args=%p ring-args=%p req=%p list-req=%p\n",
+		 __func__, q_req->args, ring_req->req.args, &ring_req->req, q_req);
 
 	rc = fuse_dev_uring_write_to_ring(ring_req);
 	if (rc) {
@@ -368,7 +376,7 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 	struct fuse_ring_req *ring_req;
 	struct fuse_req *req = NULL;
 	uint64_t req_cnt;
-	unsigned int tag;
+	unsigned int tag = -1;
 	const size_t queue_depth = fc->ring.queue_depth;
 	const struct fuse_iqueue *fiq = &fc->iq;
 
@@ -383,6 +391,9 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 			/* no need to wait for background requests, the caller
 			 * can handle request allocation failures
 			 */
+			pr_debug("%s Active bgnd=%d max-bnd=%zu\n", __func__,
+				 queue->req_active_background,
+				 fc->ring.max_background);
 			goto out;
 		}
 	} else {
@@ -441,7 +452,8 @@ out:
 		__set_bit(FR_URING, &req->flags);
 	}
 
-	pr_debug("%s tag %d cnt=%llu req=%p\n", __func__, tag, req_cnt, req);
+	pr_debug("%s: tag=%d cnt=%llu req=%p background=%d\n",
+		 __func__, tag, req_cnt, req, for_background);
 
 	return req;
 }
@@ -491,12 +503,13 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 
 	ring_req->state = FUSE_RING_REQ_STATE_WAITING;
 
+	pr_debug("%s: tag=%d req=%p backgnd=%d\n",
+		 __func__, ring_req->tag, req, test_bit(FR_BACKGROUND, &req->flags));
+
 	if (test_bit(FR_BACKGROUND, &req->flags))
 		queue->req_active_background--;
 	else {
 		queue->req_avtive_foreground--;
-		pr_debug("%s:%d ac-foregnd=%d\n", __func__, __LINE__,
-			 queue->req_avtive_foreground);
 	}
 
 	ring_req->kbuf->flags = 0;
@@ -509,9 +522,11 @@ out:
 		if (released) {
 			spin_lock(&fc->ring.stop_waitq.lock);
 			fc->ring.queue_refs--;
-			fuse_uring_check_ring_destruct_destruct(fc);
+			pr_debug("%s: Queue refs=%d\n", __func__, fc->ring.queue_refs);
+			fuse_uring_check_ring_destruct(fc);
 			spin_unlock(&fc->ring.stop_waitq.lock);
-		}
+		} else
+			pr_debug("%s: Could not free req\n", __func__);
 	}
 }
 EXPORT_SYMBOL_GPL(fuse_dev_uring_req_release);
@@ -562,10 +577,12 @@ int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 		WRITE_ONCE(ring_req->cmd, cmd);
 
-
 		ret = fuse_dev_uring_fetch_queued(fc, queue, ring_req);
-
 		if (ret >= 0) {
+			pr_debug("%s tag=%d req=%p list-req=%p bgnd=%d\n",
+				 __func__, ring_req->tag,
+				 &ring_req->req, ring_req->req_ptr,
+				 test_bit(FR_BACKGROUND, &ring_req->req.flags));
 
 			/* command registration or list req fetch - assing
 			 * credits to make subtraction logic to work
@@ -589,7 +606,6 @@ int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
 				fuse_dev_uring_req_release(&ring_req->req);
 			}
 		}
-
 
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
@@ -649,16 +665,19 @@ EXPORT_SYMBOL(fuse_dev_uring);
  *
  * Has to be called with
  */
-void fuse_uring_check_ring_destruct_destruct(struct fuse_conn *fc)
+void fuse_uring_check_ring_destruct(struct fuse_conn *fc)
 __must_hold(&fc->ring.stop_waitq.lock)
 {
 	if (fc->ring.queue_refs == 0) {
+		pr_debug("Destructing ring queues\n");
 		kfree(fc->ring.queues);
 		fc->ring.initialized = 0;
 		fc->ring.queues = NULL;
 		fc->ring.queue_depth = 0;
 		fc->ring.nr_queues = 0;
 	}
+	else
+		pr_debug("%s: queue-refs=%d\n", __func__, fc->ring.queue_refs);
 }
 
 /**
@@ -685,13 +704,16 @@ void fuse_uring_start_destruct(struct fuse_conn *fc)
 		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
 			struct fuse_ring_req *req = &queue->ring_req[tag];
 			bool released = fuse_uring_free_req(fc, queue, req);
-			if (released)
+			if (released) {
 				fc->ring.queue_refs--;
-			BUG_ON(fc->ring.queue_refs > 0);
+				pr_debug("%s: queue-refs=%d\n",
+					 __func__, fc->ring.queue_refs);
+			} else
+				pr_debug("%s: Could not free request\n", __func__);
 		}
 	}
 
-	fuse_uring_check_ring_destruct_destruct(fc);
+	fuse_uring_check_ring_destruct(fc);
 out:
 	spin_unlock(&fc->ring.stop_waitq.lock);
 }
@@ -789,8 +811,13 @@ static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg
 
 	fc->ring.max_background = cfg->max_background;
 
-	if (cfg->max_background >= cfg->queue_depth) {
-		pr_info("Invalid ring configuration, nr-background > nr-requests\n");
+	if (cfg->max_background >= cfg->queue_depth || !cfg->max_background) {
+		if (fc->ring.max_background == 0) {
+			pr_info("Invalid ring configuration, no background queue.\n");
+
+		} else
+			pr_info("Invalid ring configuration, "
+				"nr-background > nr-requests.\n");
 		rc = -EINVAL;
 		goto unlock;
 	}
@@ -828,6 +855,7 @@ static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg
 		}
 	}
 
+	pr_debug("%s Queue-refs=%d\n", __func__, fc->ring.queue_refs);
 	fc->ring.initialized = 1;
 	rc = 0;
 

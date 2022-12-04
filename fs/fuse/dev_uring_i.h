@@ -25,7 +25,6 @@ void fuse_dev_uring_req_release(struct fuse_req *req);
 
 int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags);
 int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma);
-void fuse_dev_ring_stop_monitor_fn(struct work_struct *work);
 
 
 #endif
