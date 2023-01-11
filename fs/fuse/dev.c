@@ -818,9 +818,11 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 			buf = pgaddr + cs->offset;
 		}
 
+#if 0
 		pr_debug("%s:%d write=%d ring_buf=%p arg-buf=%p off=%d ncpy: %u\n",
 			 __func__, __LINE__, cs->write, buf, *val, cs->ring.offset,
 			 ncpy);
+#endif
 
 		if (cs->write)
 			memcpy(buf, *val, ncpy);
@@ -2222,8 +2224,6 @@ void fuse_abort_conn(struct fuse_conn *fc)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
-
 	spin_lock(&fc->lock);
 	if (fc->connected) {
 		struct fuse_dev *fud;
@@ -2283,7 +2283,8 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->lock);
 	}
 
-	fuse_uring_start_destruct(fc);
+	if (fc->ring.queues != NULL)
+		schedule_delayed_work(&fc->ring.stop_monitor, 0);
 }
 EXPORT_SYMBOL_GPL(fuse_abort_conn);
 
@@ -2293,13 +2294,15 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	smp_mb();
 	//FIXME
 	// wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
+
+	if (fc->ring.queues != NULL)
+		wait_event(fc->ring.stop_waitq, fc->ring.queue_refs == 0);
+
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
 {
 	struct fuse_dev *fud = fuse_get_dev(file);
-
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
 
 	if (fud) {
 		struct fuse_conn *fc = fud->fc;
@@ -2398,8 +2401,6 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 		else
 			res = -EFAULT;
 
-		pr_debug("%s:%d FUSE_DEV_IOC_URING res=%d\n", __func__, __LINE__,
-			res);
 		break;
 	default:
 		res = -ENOTTY;

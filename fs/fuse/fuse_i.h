@@ -531,20 +531,26 @@ struct fuse_sync_bucket {
 };
 
 enum fuse_ring_req_state {
-	/* request is not initialized */
-	FUSE_RING_REQ_STATE_INIT   = 0,
+
+	FRRS_INVALD = 0,
+
+	/* request is basially initialied */
+	FRRS_INIT = 1u << 0,
 
 	/* request is waiting for work */
-	FUSE_RING_REQ_STATE_WAITING,
+	FRRS_WAITING = 1u << 1,
 
 	/* request is processing data */
-	FUSE_RING_REQ_STATE_REQ,
+	FRRS_REQ = 1u << 2,
 
 	/* request is in or on the way to userspace */
-	FUSE_RING_REQ_STATE_USERSPACE,
+	FRRS_USERSPACE = 1u << 3,
+
+	/* process is in the process to get freed */
+	FRRS_FREEING   = 1u << 4,
 
 	/* request is released */
-	FUSE_RING_REQ_STATE_FREED,
+	FRRS_FREED = 1u << 5,
 };
 
 struct fuse_ring_req {
@@ -556,7 +562,8 @@ struct fuse_ring_req {
 
 	struct fuse_ring_queue *queue;
 
-	enum fuse_ring_req_state state;
+	/* state the request is currently in */
+	unsigned long state;
 
 	struct fuse_req req;
 	struct fuse_req *req_ptr; /* when a list request is handled */
