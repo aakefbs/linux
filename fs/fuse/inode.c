@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -867,8 +868,6 @@ EXPORT_SYMBOL_GPL(fuse_conn_init);
 
 void fuse_conn_put(struct fuse_conn *fc)
 {
-	pr_debug("%s:%d Conn put %p \n", __func__, __LINE__, fc);
-
 	if (refcount_dec_and_test(&fc->count)) {
 		struct fuse_iqueue *fiq = &fc->iq;
 		struct fuse_sync_bucket *bucket;
@@ -1797,6 +1796,9 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 		fuse_ctl_remove_conn(fc);
 		mutex_unlock(&fuse_mutex);
 	}
+
+	if (fc->ring.queues != NULL)
+		fuse_uring_ring_destruct(fc);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_destroy);
 
@@ -1814,8 +1816,6 @@ static void fuse_sb_destroy(struct super_block *sb)
 
 void fuse_mount_destroy(struct fuse_mount *fm)
 {
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
-
 	fuse_conn_put(fm->fc);
 	kfree(fm);
 }
