@@ -575,8 +575,6 @@ struct fuse_ring_req {
 #define FUSE_URING_MAX_QUEUE_DEPTH 65535
 
 struct fuse_ring_queue {
-	// int q_id;
-
 	unsigned long flags;
 
 	struct fuse_conn *fc;
@@ -593,6 +591,11 @@ struct fuse_ring_queue {
 
 	/** waiting tasks that did not get a ring slot */
 	wait_queue_head_t waitq;
+
+	/* per queue memory buffer that is devided per request */
+	char *queue_req_buf;
+
+	int configured:1;
 
 	/* size depends on queue depth */
 	struct fuse_ring_req ring_req[];
@@ -913,7 +916,7 @@ struct fuse_conn {
 		size_t queue_depth;
 
 		/* req buffer size */
-		size_t ring_req_size;
+		size_t req_buf_sz;
 
 		/* max number of background requests per queue */
 		size_t max_background;
@@ -924,20 +927,26 @@ struct fuse_conn {
 		/* Hold ring requests */
 		struct fuse_ring_queue *queues;
 
-		/* number of entries per queue */
+		/* size of struct fuse_ring_queue + queue-depth * entry-size */
 		size_t queue_size;
+
+		/* buffer size per queue, that is used per queue entry */
+		size_t queue_buf_size;
 
 		/* When zero the queue can be freed on destruction */
 		int queue_refs;
 
-		/* did the ring get initialized already ? */
-		int initialized:1;
+		/* number of initialized queues */
+		int nr_queues_initialized;
 
 		/* one queue per core or a single queue only ? */
 		int per_core_queue:1;
 
 		/* userspace sent a stop ioctl */
 		int stop_requested:1;
+
+		/* Is the ring completely configured */
+		int configured:1;
 
 		/* userspace process */
 		struct task_struct *daemon;
