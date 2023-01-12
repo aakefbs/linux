@@ -37,6 +37,10 @@ static struct fuse_ring_queue *
 fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 {
 	char *ptr = (char *)fc->ring.queues;
+
+	if (unlikely(qid > fc->ring.nr_queues))
+		return NULL;
+
 	return (struct fuse_ring_queue *)(ptr + qid * fc->ring.queue_size);
 }
 
@@ -47,7 +51,7 @@ static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
 	int err;
-	size_t max_buf = sizeof(buf_req->in_out_arg) + fc->ring.ring_req_size;
+	size_t max_buf = sizeof(buf_req->in_out_arg) + fc->ring.req_buf_sz;
 
 	fuse_copy_init(&cs, 1, NULL);
 	cs.is_uring = 1;
@@ -74,7 +78,7 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
 {
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
-	size_t max_buf = sizeof(buf_req->in_out_arg) + fc->ring.ring_req_size;
+	size_t max_buf = sizeof(buf_req->in_out_arg) + fc->ring.req_buf_sz;
 
 	fuse_copy_init(&cs, 0, NULL);
 	cs.is_uring = 1;
@@ -469,9 +473,8 @@ static bool _fuse_uring_free_req(struct fuse_conn *fc,
 				 struct fuse_ring_queue *queue,
 				 struct fuse_ring_req *req)
 {
-	bool can_free = false;
-
-	unsigned int stop_state = FRRS_INIT | FRRS_WAITING | FRRS_FREEING;
+	bool freed = false;
+	unsigned int stop_state = FRRS_WAITING | FRRS_FREEING;
 	if (0 && fc->ring.daemon->flags & PF_EXITING) {
 		/* the process is exiting, userspace is not going to complete
 		 * the request anymore
@@ -481,17 +484,12 @@ static bool _fuse_uring_free_req(struct fuse_conn *fc,
 
 	if (req->state & stop_state) {
 		req->state = FRRS_FREED;
-		can_free = true;
-	}
-
-	if (can_free) {
-		vfree(req->kbuf);
-
 		pr_debug("releasing cmd qid=%d tag=%d\n", queue->q_id, req->tag);
 		io_uring_cmd_done(req->cmd, -EIO, 0);
+		freed = true;
 	}
 
-	return can_free;
+	return freed;
 }
 
 static void fuse_uring_free_req(struct fuse_conn *fc,
@@ -587,12 +585,22 @@ int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		goto out;
 	}
 
-	if (cmd_req->q_id >= fc->ring.nr_queues) {
+	if (unlikely(cmd_req->q_id >= fc->ring.nr_queues)) {
 		pr_info("qid=%u > nr-queues=%zu\n",
 			cmd_req->q_id, fc->ring.nr_queues);
 		goto out;
 	}
+
 	queue = fuse_uring_get_queue(fc, cmd_req->q_id);
+	if (unlikely(queue == NULL)) {
+		pr_info("Got NULL queue for qid=%d\n", cmd_req->q_id);
+		goto out;
+	}
+
+	if (unlikely(!fc->ring.configured || !queue->configured)) {
+		pr_info("Ring or queue (qid=%u) not ready.\n", cmd_req->q_id);
+		goto out;
+	}
 
 	if (cmd_req->tag > fc->ring.queue_depth) {
 		pr_info("tag=%u > queue-depth=%zu\n",
@@ -648,10 +656,6 @@ int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
-		/* user space forgot to send the buffer - invalid command */
-		if (!cmd_req->req_buf) {
-			goto out;
-		}
 		if (READ_ONCE(ring_req->state) != FRRS_USERSPACE) {
 			pr_debug("Invalid request state %lu, expected %d \n",
 				ring_req->state, FRRS_USERSPACE);
@@ -713,6 +717,8 @@ EXPORT_SYMBOL(fuse_dev_uring);
  */
 void fuse_uring_ring_destruct(struct fuse_conn *fc)
 {
+	unsigned qid;
+
 	pr_debug("%s: queue-refs=%d\n", __func__, fc->ring.queue_refs);
 
 	if (READ_ONCE(fc->ring.queue_refs) != 0) {
@@ -720,8 +726,13 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		return;
 	}
 
+	for (qid = 0; qid < fc->ring.nr_queues; qid++) {
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(fc, qid);
+		vfree(queue->queue_req_buf);
+	}
+
 	kfree(fc->ring.queues);
-	fc->ring.initialized = 0;
+	fc->ring.nr_queues_initialized = 0;
 	fc->ring.queues = NULL;
 	fc->ring.queue_depth = 0;
 	fc->ring.nr_queues = 0;
@@ -769,7 +780,7 @@ out:
  * Having a waiting userspace process if preferred, as this
  * method requires interval monitoring and hence, repeating cpu resources.
  */
-static void fuse_dev_ring_stop_monitor_fn(struct work_struct *work)
+static void fuse_dev_ring_stop_mon(struct work_struct *work)
 {
 	struct fuse_conn *fc = container_of(work, struct fuse_conn,
 					    ring.stop_monitor.work);
@@ -785,146 +796,200 @@ static void fuse_dev_ring_stop_monitor_fn(struct work_struct *work)
 }
 
 /**
- * XXX Add the qid (core number) and use __vmalloc_node_range() (needs to be
+ * use __vmalloc_node_range() (needs to be
  * exported?) or add a new (exported) function vm_alloc_user_node()
  */
-static int fuse_dev_create_uring_req_mem(struct fuse_ring_req *req, int qid,
-					 int size)
+static char *fuse_dev_uring_alloc_queue_buf(int size, int node_id)
 {
-	int node = cpu_to_node(qid);
+	char *buf;
 
-	/*
-	 * XXX Add the qid (core number) and use __vmalloc_node_range()
-	 * (needs to be exported?) or add a new (exported) vm_alloc_user_node()
-	*/
-	(void)node;
-
-	req->kbuf = vmalloc_user(size);
-
-	return req->kbuf ? 0 : -ENOMEM;
-}
-
-static int fuse_dev_uring_setup(struct fuse_conn *fc, struct fuse_uring_cfg *cfg)
-{
-	size_t req_size;
-	size_t queue_size;
-	int q_id;
-	int rc;
-
-	if (cfg->flags & FUSE_URING_IOCTL_FLAG_PER_CORE_QUEUE) {
-		if (!cpu_possible(cfg->num_queues - 1)) {
-			pr_info("per-core-queue, but number of queue "
-				"mismatches number of cpus");
-			return -EINVAL;
-		}
-	} else {
-		if (cfg->num_queues != 1) {
-			pr_info("Per-core-queue not set, expecting a single "
-				"queue");
-			return -EINVAL;
-		}
+	if (size <= 0) {
+		pr_info("Invalid queue buf size: %d.\n", size);
+		return ERR_PTR(-EINVAL);
 	}
 
-	if (cfg->mmap_req_size < FUSE_RING_HEADER_BUF_SIZE + PAGE_SIZE) {
-		pr_info("Per req mmap size too small (%d), min: %ld\n",
-			cfg->mmap_req_size,
-			FUSE_RING_HEADER_BUF_SIZE + PAGE_SIZE);
+	buf = vmalloc_user(size);
+
+	/*
+	 * XXX use __vmalloc_node_range()
+	 * (needs to be exported?) or add a new (exported) vm_alloc_user_node()
+	*/
+	(void)node_id;
+
+
+	return buf ? buf : ERR_PTR(-ENOMEM);
+}
+
+/**
+ * Ring setup for this connection
+ */
+static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
+				     struct fuse_uring_cfg *cfg)
+{
+	size_t queue_sz, req_sz;
+
+	if (cfg->queue.nr_queues == 0) {
+		pr_info("zero number of queues is invalid.\n");
 		return -EINVAL;
 	}
 
-	spin_lock(&fc->ring.stop_waitq.lock);
+	if (cfg->queue.nr_queues > num_present_cpus()) {
+		pr_info("nr-queues (%d) exceed number or cores=%d\n",
+			cfg->queue.nr_queues, num_present_cpus());
+		return -EINVAL;
 
-	if (fc->ring.initialized) {
-		rc = -EALREADY;
-		goto unlock;
+	}
+
+	if (cfg->queue.qid > 0 && cfg->queue.nr_queues != 1) {
+		pr_info("Per-core-queue not set, expecting a single "
+			"queue\n");
+		return -EINVAL;
+	}
+
+	if (cfg->queue.qid > cfg->queue.nr_queues) {
+		pr_info("qid > nr-queues\n");
+		return -EINVAL;
+	}
+
+	if (cfg->queue.req_buf_sz < sizeof(struct fuse_uring_buf_req)) {
+		pr_info("Per req buffer size too small (%d), min: %ld\n",
+			cfg->queue.req_buf_sz,
+			sizeof(struct fuse_uring_buf_req));
+		return -EINVAL;
+	}
+
+	if (unlikely(fc->ring.queues)) {
+		WARN_ON(1);
+		return -EINVAL;
 	}
 
 	fc->ring.daemon = current;
 	get_task_struct(fc->ring.daemon);
-	INIT_DELAYED_WORK(&fc->ring.stop_monitor, fuse_dev_ring_stop_monitor_fn);
-	schedule_delayed_work(&fc->ring.stop_monitor, FURING_DAEMON_MON_PERIOD);
+	INIT_DELAYED_WORK(&fc->ring.stop_monitor,
+			  fuse_dev_ring_stop_mon);
+	schedule_delayed_work(&fc->ring.stop_monitor,
+			      FURING_DAEMON_MON_PERIOD);
 
-	req_size = cfg->queue_depth * sizeof(struct fuse_ring_req);
-	queue_size = (sizeof(*fc->ring.queues) + req_size) * cfg->num_queues;
+	req_sz = cfg->queue.queue_depth * sizeof(struct fuse_ring_req);
+	fc->ring.nr_queues = cfg->queue.nr_queues;
+	fc->ring.queue_depth = cfg->queue.queue_depth;
+	fc->ring.per_core_queue = cfg->queue.nr_queues == 1;
+	fc->ring.req_buf_sz = cfg->queue.req_buf_sz;
+	fc->ring.queue_buf_size = fc->ring.req_buf_sz * fc->ring.queue_depth;
 
-	fc->ring.nr_queues = cfg->num_queues;
-	fc->ring.queue_depth = cfg->queue_depth;
-	fc->ring.per_core_queue = cfg->flags & FUSE_URING_IOCTL_FLAG_PER_CORE_QUEUE;
-	fc->ring.ring_req_size = cfg->mmap_req_size;
-	fc->ring.queues = kcalloc(cfg->num_queues, queue_size, GFP_KERNEL);
-	if (!fc->ring.queues) {
-		rc = -ENOMEM;
-		goto unlock;
-	}
-	fc->ring.queue_size = queue_size;
+	queue_sz = (sizeof(*fc->ring.queues) + req_sz);
+	fc->ring.queues = kcalloc(cfg->queue.nr_queues, queue_sz, GFP_KERNEL);
+	if (!fc->ring.queues)
+		return -ENOMEM;
+	fc->ring.queue_size = queue_sz;
 
-	fc->ring.max_background = cfg->max_background;
+	fc->ring.max_background = cfg->queue.max_background;
 
-	if (cfg->max_background >= cfg->queue_depth || !cfg->max_background) {
+	if (cfg->queue.max_background >= cfg->queue.queue_depth ||
+	   !cfg->queue.max_background) {
 		if (fc->ring.max_background == 0) {
 			pr_info("Invalid ring configuration, no background queue.\n");
-
 		} else
 			pr_info("Invalid ring configuration, "
 				"nr-background > nr-requests.\n");
-		rc = -EINVAL;
-		goto unlock;
+		return -EINVAL;
 	}
 
 	fc->ring.queue_refs = 0;
-	fc->ring.max_foreground = cfg->queue_depth - cfg->max_background;
-	for (q_id = 0; q_id < cfg->num_queues; q_id++) {
-		int tag;
-		struct fuse_ring_queue *queue = fuse_uring_get_queue(fc, q_id);
-		queue->q_id = q_id;
-		queue->fc = fc;
-		queue->req_active_foreground = 0;
-		bitmap_zero(queue->req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
-		init_waitqueue_head(&queue->waitq);
+	fc->ring.max_foreground = cfg->queue.queue_depth -
+				  cfg->queue.max_background;
 
-		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-			struct fuse_ring_req *req = &queue->ring_req[tag];
-			req->queue = queue;
-			req->tag = tag;
-			req->req_ptr = NULL;
+	return 0;
+}
 
-			rc = fuse_dev_create_uring_req_mem(req, q_id,
-							   cfg->mmap_req_size);
+static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
+				    unsigned node_id)
+{
+	int tag;
+	struct fuse_ring_queue *queue;
 
-			pr_debug("initialize qid=%d tag=%d queue=%p req=%p kbuf=%p",
-				 q_id, tag, queue, req, req->kbuf);
-
-			if (rc != 0)
-				goto unlock;
-			req->kbuf->flags = 0;
-
-			WRITE_ONCE(req->state, FRRS_INIT);
-			fc->ring.queue_refs++;
-		}
+	if (qid > fc->ring.nr_queues) {
+		pr_info("fuse ring queue config: qid=%u > nr-queues=%zu\n",
+			qid, fc->ring.nr_queues);
+		return -EINVAL;
 	}
+	queue = fuse_uring_get_queue(fc, qid);
+
+	if (queue->configured) {
+		pr_info("fuse ring qid=%u already configured!\n", qid);
+		return -EALREADY;
+	}
+
+	queue->q_id = qid;
+	queue->fc = fc;
+	queue->req_active_foreground = 0;
+	bitmap_zero(queue->req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
+	init_waitqueue_head(&queue->waitq);
+
+	queue->queue_req_buf =
+		fuse_dev_uring_alloc_queue_buf(fc->ring.queue_buf_size, node_id);
+	if (IS_ERR(queue->queue_req_buf))
+	{
+		int err = PTR_ERR(queue->queue_req_buf);
+		queue->queue_req_buf = NULL;
+		return err;
+	}
+
+	for (tag = 0; tag < fc->ring.queue_depth; tag++) {
+		struct fuse_ring_req *req = &queue->ring_req[tag];
+		req->queue = queue;
+		req->tag = tag;
+		req->req_ptr = NULL;
+		req->kbuf = (struct fuse_uring_buf_req *)(queue->queue_req_buf +
+				fc->ring.req_buf_sz * tag);
+
+		pr_debug("initialize qid=%d tag=%d queue=%p req=%p",
+			 qid, tag, queue, req);
+
+		req->kbuf->flags = 0;
+
+		WRITE_ONCE(req->state, FRRS_INIT);
+		fc->ring.queue_refs++;
+	}
+
+	queue->configured = 1;
+	fc->ring.nr_queues_initialized++;
+	if (fc->ring.nr_queues_initialized == fc->ring.nr_queues)
+		fc->ring.configured = 1;
 
 	pr_debug("%s Queue-refs=%d\n", __func__, fc->ring.queue_refs);
-	fc->ring.initialized = 1;
-	rc = 0;
 
-unlock:
-	if (rc < 0) {
-		for (q_id = 0; q_id < cfg->num_queues; q_id++) {
-			struct fuse_ring_queue *queue =
-				fuse_uring_get_queue(fc, q_id);
-			int tag;
-			for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-				struct fuse_ring_req *req = &queue->ring_req[tag];
-				if (!req->kbuf)
-					break; /* first req not allocated yet */
+	return 0;
+}
 
-				vfree(req->kbuf);
-				fc->ring.queue_refs--;
-			}
-		}
-		fuse_uring_ring_destruct(fc);
+/**
+ * Configure the queue for t he given qid. First call will also initialize
+ * the ring for this connection.
+ */
+static int fuse_dev_uring_cfg(struct fuse_conn *fc, unsigned qid,
+			      struct fuse_uring_cfg *cfg)
+{
+	int rc;
+
+	/* The lock is taken, so that user space may configure all queues
+	 * in parallel
+	 */
+	spin_lock(&fc->ring.stop_waitq.lock);
+
+	if (fc->ring.configured) {
+		rc = -EALREADY;
+		goto unlock;
 	}
 
+	if (fc->ring.daemon == NULL) {
+		rc = fuse_dev_conn_uring_cfg(fc, cfg);
+		if (rc != 0)
+			goto unlock;
+	}
+
+	rc = fuse_dev_uring_queue_cfg(fc, qid, cfg->queue.numa_node_id);
+
+unlock:
 	spin_unlock(&fc->ring.stop_waitq.lock);
 
 	return rc;
@@ -971,18 +1036,19 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 	if (fud == NULL)
 		return -ENODEV;
 
-	pr_debug("%s flags=%llx nq=%d  qdepth=%d\n",
-		 __func__, cfg->flags, cfg->num_queues, cfg->queue_depth);
+	pr_debug("%s flags=%llx qid=%d nq=%d  qdepth=%d\n",
+		 __func__, cfg->flags, cfg->queue.qid, cfg->queue.nr_queues,
+		 cfg->queue.queue_depth);
 
 	fc = fud->fc;
 
-	if (cfg->flags & FUSE_URING_IOCTL_FLAG_CFG) {
+	if (cfg->flags & FUSE_URING_IOCTL_FLAG_QUEUE_CFG) {
 		/* config flag is incompatible to WAIT and STOP */
 		if ((cfg->flags & FUSE_URING_IOCTL_FLAG_WAIT) ||
 		    (cfg->flags & FUSE_URING_IOCTL_FLAG_STOP))
 			return -EINVAL;
 
-		return fuse_dev_uring_setup(fc, cfg);
+		return fuse_dev_uring_cfg(fc, cfg->queue.qid, cfg);
 	}
 
 	if (cfg->flags & FUSE_URING_IOCTL_FLAG_WAIT) {
@@ -1008,39 +1074,42 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	struct fuse_dev *fud = fuse_get_dev(filp);
 	struct fuse_conn *fc = fud->fc;
 	size_t sz = vma->vm_end - vma->vm_start;
-	unsigned qid, tag;
+	unsigned qid;
 	int ret;
 	loff_t off;
 	struct fuse_ring_queue *queue;
-	struct fuse_ring_req *req;
 
 	/* check if uring is configured and if the requested size matches */
-	if (fc->ring.nr_queues == 0 || fc->ring.queue_depth == 0 ||
-	    sz != fc->ring.ring_req_size) {
+	if (fc->ring.nr_queues == 0 || fc->ring.queue_depth == 0) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	/* offset actually has the specifies which ring request the mmap is for
-	 * additional PAGE_SIZE division is done as offset has to be page
-	 * aligned, so actual values had been multiplied by PAGE_SIZE by the
-	 * mmap requesting side */
+	if (sz != fc->ring.queue_buf_size) {
+		ret = -EINVAL;
+		pr_debug("mmap size mismatch, expected %zu got %zu\n",
+			 fc->ring.queue_buf_size, sz);
+		goto out;
+	}
+
+	/* XXX: Enforce a cloned session per ring and assign fud per queue
+	 * and use fud as key to find the right queue?
+	 */
 	off = (vma->vm_pgoff << PAGE_SHIFT) / PAGE_SIZE;
 	qid = off / (fc->ring.queue_depth);
-	tag = off % (fc->ring.queue_depth);
-	if (qid + 1 > fc->ring.nr_queues || tag + 1 > fc->ring.queue_depth) {
-		ret = -EINVAL;
-		goto out;
-	}
 
 	queue = fuse_uring_get_queue(fc, qid);
-	req = &queue->ring_req[tag];
 
-	ret = remap_vmalloc_range(vma, req->kbuf, 0);
+	if (queue == NULL) {
+		pr_debug("fuse uring mmap: invalid qid=%u\n", qid);
+		return -ERANGE;
+	}
+
+	ret = remap_vmalloc_range(vma, queue->queue_req_buf, 0);
 out:
-	pr_debug("%s: pid %d req=%p addr %p sz %zu qid: %d tag: %d ret %d\n",
-		 __func__, current->pid, req, (char *)vma->vm_start,
-		 sz, qid, tag, ret);
+	pr_debug("%s: pid %d qid: %u addr: %p sz: %zu  ret: %d\n",
+		 __func__, current->pid, qid, (char *)vma->vm_start,
+		 sz, ret);
 
 	return ret;
 }
