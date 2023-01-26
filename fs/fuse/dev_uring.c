@@ -698,10 +698,10 @@ out:
 
 	if (ret < 0) {
 		io_uring_cmd_done(cmd, ret, 0);
-		pr_info("%s: req error: op=%d, tag=%d ret=%d io_flags=%x\n",
+		pr_debug("%s: req error: op=%d, tag=%d ret=%d io_flags=%x\n",
 			__func__, cmd_op, cmd_req->tag, ret, issue_flags);
 	} else {
-		pr_info("%s: %s cmd op %d queue %d tag %d result %d\n",
+		pr_debug("%s: %s cmd op %d queue %d tag %d result %d\n",
 			 __func__, ret == 0 ? "req ring queued" : "req sent back",
 			cmd_op, cmd_req->q_id, cmd_req->tag, ret);
 
@@ -826,21 +826,17 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 		return -EINVAL;
 	}
 
-	if (cfg->queue.nr_queues > num_present_cpus()) {
-		pr_info("nr-queues (%d) exceed number or cores=%d\n",
+	if (cfg->queue.nr_queues > 1 &&
+	    cfg->queue.nr_queues != num_present_cpus()) {
+		pr_info("Number of queues (%d) does not match the "
+			"number of cores (%d).\n",
 			cfg->queue.nr_queues, num_present_cpus());
-		return -EINVAL;
-
-	}
-
-	if (cfg->queue.qid > 0 && cfg->queue.nr_queues != 1) {
-		pr_info("Per-core-queue not set, expecting a single "
-			"queue\n");
 		return -EINVAL;
 	}
 
 	if (cfg->queue.qid > cfg->queue.nr_queues) {
-		pr_info("qid > nr-queues\n");
+		pr_info("qid (%d) exceeds number of queues (%d)\n",
+			cfg->queue.qid, cfg->queue.nr_queues);
 		return -EINVAL;
 	}
 
@@ -866,7 +862,7 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 	req_sz = cfg->queue.queue_depth * sizeof(struct fuse_ring_req);
 	fc->ring.nr_queues = cfg->queue.nr_queues;
 	fc->ring.queue_depth = cfg->queue.queue_depth;
-	fc->ring.per_core_queue = cfg->queue.nr_queues == 1;
+	fc->ring.per_core_queue = cfg->queue.nr_queues > 1;
 	fc->ring.req_buf_sz = cfg->queue.req_buf_sz;
 	fc->ring.queue_buf_size = fc->ring.req_buf_sz * fc->ring.queue_depth;
 
