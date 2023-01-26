@@ -186,6 +186,12 @@ void *vmalloc_user(unsigned long size)
 }
 EXPORT_SYMBOL(vmalloc_user);
 
+void *vmalloc_node_user(unsigned long size, int node)
+{
+	return __vmalloc_user_flags(size, GFP_KERNEL | __GFP_ZERO);
+}
+EXPORT_SYMBOL(vmalloc_node_user);
+
 struct page *vmalloc_to_page(const void *addr)
 {
 	return virt_to_page(addr);
