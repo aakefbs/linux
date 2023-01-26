@@ -162,7 +162,7 @@ err:
 }
 EXPORT_SYMBOL_GPL(fuse_dev_uring_write_to_ring);
 
-/**
+/*
  * Checks for errors and stores it into the request
  */
 static int fuse_dev_uring_ring_has_err(struct fuse_conn *fc,
@@ -466,7 +466,7 @@ out:
 EXPORT_SYMBOL_GPL(fuse_request_alloc_ring);
 
 
-/**
+/*
  * @return true when the request could be released
  */
 static bool _fuse_uring_free_req(struct fuse_conn *fc,
@@ -524,7 +524,7 @@ out:
 }
 
 /**
- * The request is no longer needed, it can handle new data
+ * Release a ring request, it is no longer needed and can handle new data
  */
 void fuse_dev_uring_req_release(struct fuse_req *req)
 {
@@ -568,7 +568,11 @@ out:
 }
 EXPORT_SYMBOL_GPL(fuse_dev_uring_req_release);
 
-int fuse_dev_uring(struct io_uring_cmd *cmd, unsigned int issue_flags)
+/**
+ * Entry function from io_uring to handle the given passthrough command
+ * (op cocde IORING_OP_URING_CMD)
+ */
+int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 {
 	const struct fuse_uring_cmd_req *cmd_req =
 		(struct fuse_uring_cmd_req *)cmd->cmd;
@@ -744,8 +748,8 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 }
 EXPORT_SYMBOL(fuse_uring_ring_destruct);
 
-/**
- *  Destruct the ring
+/*
+ *  Start the ring destruction
  */
 static void fuse_uring_start_destruct(struct fuse_conn *fc)
 {
@@ -774,11 +778,9 @@ out:
 	spin_unlock(&fc->ring.stop_waitq.lock);
 }
 
-/**
- * Fallback to stop uring resources if there is no thread from
- * userspace doing that.
- * Having a waiting userspace process if preferred, as this
- * method requires interval monitoring and hence, repeating cpu resources.
+/*
+ * monitoring functon to check if fuse shall be destructed, run
+ * as delayed interval task
  */
 static void fuse_dev_ring_stop_mon(struct work_struct *work)
 {
