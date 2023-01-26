@@ -149,6 +149,9 @@ extern void *vzalloc_noprof(unsigned long size) __alloc_size(1);
 extern void *vmalloc_user_noprof(unsigned long size) __alloc_size(1);
 #define vmalloc_user(...)	alloc_hooks(vmalloc_user_noprof(__VA_ARGS__))
 
+extern void *vmalloc_node_user_noprof(unsigned long size, int node) __alloc_size(1);
+#define vmalloc_node_user(...)	alloc_hooks(vmalloc_node_user_noprof(__VA_ARGS__))
+
 extern void *vmalloc_node_noprof(unsigned long size, int node) __alloc_size(1);
 #define vmalloc_node(...)	alloc_hooks(vmalloc_node_noprof(__VA_ARGS__))
 
