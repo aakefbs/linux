@@ -799,7 +799,7 @@ static void fuse_dev_ring_stop_mon(struct work_struct *work)
  * use __vmalloc_node_range() (needs to be
  * exported?) or add a new (exported) function vm_alloc_user_node()
  */
-static char *fuse_dev_uring_alloc_queue_buf(int size, int node_id)
+static char *fuse_dev_uring_alloc_queue_buf(int size, int node)
 {
 	char *buf;
 
@@ -808,14 +808,7 @@ static char *fuse_dev_uring_alloc_queue_buf(int size, int node_id)
 		return ERR_PTR(-EINVAL);
 	}
 
-	buf = vmalloc_user(size);
-
-	/*
-	 * XXX use __vmalloc_node_range()
-	 * (needs to be exported?) or add a new (exported) vm_alloc_user_node()
-	*/
-	(void)node_id;
-
+	buf = vmalloc_node_user(size, node);
 
 	return buf ? buf : ERR_PTR(-ENOMEM);
 }
