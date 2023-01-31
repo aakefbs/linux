@@ -349,21 +349,26 @@ out:
 }
 
 static struct fuse_ring_queue *
-fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc)
+fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background)
 {
-	unsigned int core = 0;
+	unsigned int qid = 0;
 
-	/* XXX 	Use raw_smp_processor_id()? */
-	if (fc->ring.per_core_queue)
-		core = task_cpu(current);
-
-	if (unlikely(core) >= fc->ring.nr_queues) {
-		WARN_ONCE(1, "Core number (%u) exceeds nr of ring queues (%zu)\n",
-			  core, fc->ring.nr_queues);
-		core = 0;
+	if (fc->ring.per_core_queue) {
+		if (!for_background ) {
+			qid = task_cpu(current);
+			if (unlikely(qid) >= fc->ring.nr_queues) {
+				WARN_ONCE(1, "Core number (%u) exceeds nr of ring "
+					  "queues (%zu)\n", qid, fc->ring.nr_queues);
+				qid = 0;
+			}
+		} else {
+			/* XXX Allow CQE coalescence in userspace. */
+			qid = atomic_inc_return(&fc->ring.background_cnt);
+			qid %= fc->ring.nr_queues;
+		}
 	}
 
-	return fuse_uring_get_queue(fc, core);
+	return fuse_uring_get_queue(fc, qid);
 }
 
 struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
@@ -378,7 +383,7 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 	const size_t queue_depth = fc->ring.queue_depth;
 	const struct fuse_iqueue *fiq = &fc->iq;
 
-	queue = fuse_dev_uring_queue_from_current_task(fc);
+	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
 	spin_lock(&queue->waitq.lock);
 
 	pr_debug("%s:%d ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
@@ -712,7 +717,7 @@ out:
 	}
 	return -EIOCBQUEUED;
 }
-EXPORT_SYMBOL(fuse_dev_uring);
+EXPORT_SYMBOL(fuse_dev_uring_cmd);
 
 /**
  * Finalize the ring destruction when queue ref counters are zero.
@@ -780,7 +785,7 @@ out:
 
 /*
  * monitoring functon to check if fuse shall be destructed, run
- * as delayed interval task
+ * as delayed task
  */
 static void fuse_dev_ring_stop_mon(struct work_struct *work)
 {

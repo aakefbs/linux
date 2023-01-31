@@ -951,6 +951,9 @@ struct fuse_conn {
 		/* Is the ring completely configured */
 		int configured:1;
 
+		/* background request counter, to identify next qid */
+		atomic_t background_cnt;
+
 		/* userspace process */
 		struct task_struct *daemon;
 
