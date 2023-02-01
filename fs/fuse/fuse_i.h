@@ -948,8 +948,20 @@ struct fuse_conn {
 		/* Is the ring completely configured */
 		int configured:1;
 
+		/* lock for background request handling */
+		spinlock_t backgnd_qid_lock;
+
 		/* background request counter, to identify next qid */
-		atomic_t background_cnt;
+		int background_qid;
+
+		/* number of requests on background_qid */
+		int backgnd_queue_cnt;
+
+		/* How many background requests to aggregate per queue,
+		 * before switching to the next queue. Userspace might use
+		 * this to coalescence CQEs/IOs
+		 */
+		size_t max_backgnd_aggr;
 
 		/* userspace process */
 		struct task_struct *daemon;

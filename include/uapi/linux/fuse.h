@@ -980,10 +980,20 @@ struct fuse_uring_cfg {
 			/* max number of background requests
 			 * max foreground is calculated as queue_depth - max_background
 			 */
-			uint32_t max_background;
+			uint32_t backgnd_queue_depth;
 
 			/* numa node this queue runs on; UINT32_MAX if any*/
 			uint32_t numa_node_id;
+
+			/* For background requests, specifies max number of req
+			 * on the same queue, before it switches to the next
+			 * queue (core). Reduces queue/core parallism.
+			 * Max is max_background, min is 1 (0 is accepted and
+			 * treated as 1)
+			 */
+			uint32_t max_backgnd_aggr;
+
+			uint32_t queue_padding;
 		} queue;
 	};
 

@@ -348,27 +348,108 @@ out:
 	return ret;
 }
 
+/*
+ * @return locked queue for background requests, may return NULL if no queue
+ * is available
+ */
+static struct fuse_ring_queue *
+fuse_dev_uring_queue_for_background_req(struct fuse_conn *fc)
+{
+	unsigned int qid, cnt;
+	struct fuse_ring_queue *queue = NULL;
+	int retries = 0;
+
+	/* backgnd_queue_cnt logic is to queue multiple requests to the
+	 * same queue, so that userspace has the possibility to coalescence CQEs
+	 * (IOs) - background requests are page cache read/writes and userspace
+	 * might prefer to do large IOs, beyond fuse req max IO size.
+	 */
+	spin_lock(&fc->ring.backgnd_qid_lock);
+	qid = fc->ring.background_qid;
+	cnt = fc->ring.backgnd_queue_cnt;
+	while (queue == NULL && retries != fc->ring.nr_queues) {
+		if (cnt > fc->ring.max_backgnd_aggr) {
+			cnt = 0;
+			qid = (qid + 1) % fc->ring.nr_queues;
+		}
+
+		if (unlikely(qid >= fc->ring.nr_queues)) {
+			WARN_ON(1);
+			qid = 0;
+			cnt = 0;
+		}
+		queue = fuse_uring_get_queue(fc, qid);
+		cnt++;
+
+		spin_lock(&queue->waitq.lock);
+		if (queue->req_active_background >= fc->ring.max_background) {
+			/* no need to wait for background requests, the caller
+			 * can handle request allocation failures
+			 */
+			pr_debug("%s Active bgnd=%d max-bnd=%zu\n", __func__,
+				 queue->req_active_background,
+				 fc->ring.max_background);
+			spin_unlock(&queue->waitq.lock);
+			qid = (qid + 1) % fc->ring.nr_queues;
+			cnt = 0;
+			queue = NULL;
+		}
+		retries++;
+	}
+
+	fc->ring.background_qid = qid;
+	fc->ring.backgnd_queue_cnt = cnt;
+
+	/* queue has to be kept locked, to avoid that other threads
+	 * take requests and invalidate the ring.backgnd logic
+	 */
+	spin_unlock(&fc->ring.backgnd_qid_lock);
+
+	return queue;
+}
+
+/*
+ * @return queue to that will take the request, might be NULL if for_background
+ * The returned queue is waitq locked
+ */
 static struct fuse_ring_queue *
 fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background)
 {
+	const struct fuse_iqueue *fiq = &fc->iq;
 	unsigned int qid = 0;
+	struct fuse_ring_queue *queue;
+
+	if (for_background && fc->ring.per_core_queue) {
+		/* more complex handling, for coalescencing */
+		pr_devel("%s:%d here\n", __func__, __LINE__);
+		return fuse_dev_uring_queue_for_background_req(fc);
+	}
 
 	if (fc->ring.per_core_queue) {
-		if (!for_background ) {
-			qid = task_cpu(current);
-			if (unlikely(qid) >= fc->ring.nr_queues) {
-				WARN_ONCE(1, "Core number (%u) exceeds nr of ring "
-					  "queues (%zu)\n", qid, fc->ring.nr_queues);
-				qid = 0;
-			}
-		} else {
-			/* XXX Allow CQE coalescence in userspace. */
-			qid = atomic_inc_return(&fc->ring.background_cnt);
-			qid %= fc->ring.nr_queues;
+		pr_devel("%s:%d here\n", __func__, __LINE__);
+		qid = task_cpu(current);
+		if (unlikely(qid) >= fc->ring.nr_queues) {
+			WARN_ONCE(1, "Core number (%u) exceeds nr of ring "
+				  "queues (%zu)\n", qid, fc->ring.nr_queues);
+			qid = 0;
 		}
 	}
 
-	return fuse_uring_get_queue(fc, qid);
+	pr_devel("%s:%d here\n", __func__, __LINE__);
+	queue = fuse_uring_get_queue(fc, qid);
+	spin_lock(&queue->waitq.lock);
+	/* foreground waits until there is space in the queue */
+	while (queue->req_active_foreground >= fc->ring.max_foreground) {
+		wait_event_interruptible_exclusive_locked
+			(queue->waitq, (queue->req_active_foreground > 0));
+
+		if ((fc->ring.daemon->flags & PF_EXITING) ||
+		    !fiq->connected || fc->ring.stop_requested ||
+		    (current->flags & PF_EXITING))
+			break;
+	}
+
+	return queue;
 }
 
 struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
@@ -381,10 +462,9 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 	uint64_t req_cnt;
 	unsigned int tag = -1;
 	const size_t queue_depth = fc->ring.queue_depth;
-	const struct fuse_iqueue *fiq = &fc->iq;
 
+	/* returned queue is locked */
 	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
-	spin_lock(&queue->waitq.lock);
 
 	pr_debug("%s:%d ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
 		"max-backgnd=%zu\n", __func__, __LINE__,
@@ -394,47 +474,35 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 	/* The conditions below require that neither fore- nor background
 	 * requests can take all queue entries
 	 */
-	if (for_background) {
-		pr_debug("%s:%d Here\n", __func__, __LINE__);
-		if (queue->req_active_background >= fc->ring.max_background) {
-			/* no need to wait for background requests, the caller
-			 * can handle request allocation failures
-			 */
-			pr_debug("%s Active bgnd=%d max-bnd=%zu\n", __func__,
-				 queue->req_active_background,
-				 fc->ring.max_background);
-			goto out;
-		}
-	} else {
-		pr_debug("%s:%d Here\n", __func__, __LINE__);
-
-		/* foreground waits until there is space in the queue */
-		while (queue->req_active_foreground >= fc->ring.max_foreground)
-		{
-			wait_event_interruptible_exclusive_locked
-				(queue->waitq, (queue->req_active_foreground > 0));
-
-			if ((fc->ring.daemon->flags & PF_EXITING) ||
-			    !fiq->connected || fc->ring.stop_requested ||
-			    (current->flags & PF_EXITING))
-				goto out;
+	if (!queue) {
+		if (for_background)
+			return NULL;
+		else {
+			/* something went wrong, not supposed to be NULL */
+			WARN_ON(1);
+			return NULL;
 		}
 	}
-
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
 
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
-		pr_info("No free bit found\n");
-		BUG_ON(1);
+		pr_info("ring: no free bit found for qid=%d backgnd=%d "
+			"ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
+			"max-backgnd=%zu\n", queue->qid, for_background,
+			queue->req_active_foreground,
+			queue->req_active_background,
+			fc->ring.max_foreground, fc->ring.max_background);
+		WARN_ON(1);
 		goto out;
 	}
+
+	pr_devel("%s:%d here\n", __func__, __LINE__);
 
 	ring_req = &queue->ring_req[tag];
 	if (unlikely(ring_req->state != FRRS_WAITING)) {
 		pr_info("Invalid request state %lu.\n",
 			ring_req->state);
-		BUG_ON(1);
+		WARN_ON(1);
 		goto out;
 	}
 
@@ -449,9 +517,10 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 		queue->req_active_foreground++;
 	}
 
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
 
 	req = &ring_req->req;
+	pr_debug("queue bit op fc=%p qid=%d tag=%d -> 0\n",
+		fc, queue->qid, ring_req->tag);
 	__clear_bit(tag, queue->req_avail_map);
 
 out:
@@ -562,6 +631,10 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 	}
 
 	ring_req->kbuf->flags = 0;
+
+	pr_debug("queue bit op fc=%p qid=%d tag=%d -> 1\n",
+		 fc, queue->qid, ring_req->tag);
+
 	__set_bit(ring_req->tag, queue->req_avail_map);
 	wake_up_locked(&queue->waitq);
 out:
@@ -824,7 +897,7 @@ static char *fuse_dev_uring_alloc_queue_buf(int size, int node)
  * Ring setup for this connection
  */
 static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
-				     struct fuse_uring_cfg *cfg)
+				   struct fuse_uring_cfg *cfg)
 {
 	size_t queue_sz, req_sz;
 
@@ -854,6 +927,22 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 		return -EINVAL;
 	}
 
+	if (cfg->queue.backgnd_queue_depth >= cfg->queue.queue_depth ||
+	   !cfg->queue.backgnd_queue_depth) {
+		if (!cfg->queue.backgnd_queue_depth) {
+			pr_info("Invalid ring configuration, no background queue.\n");
+		} else
+			pr_info("Invalid ring configuration, "
+				"nr-background > nr-requests.\n");
+		return -EINVAL;
+	}
+	if (cfg->queue.max_backgnd_aggr > cfg->queue.backgnd_queue_depth) {
+		pr_info("Background coalescence (%d) cannot be higher than "
+			"background queue depth %d\n", cfg->queue.max_backgnd_aggr,
+			cfg->queue.backgnd_queue_depth);
+		return -EINVAL;
+	}
+
 	if (unlikely(fc->ring.queues)) {
 		WARN_ON(1);
 		return -EINVAL;
@@ -872,6 +961,7 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 	fc->ring.per_core_queue = cfg->queue.nr_queues > 1;
 	fc->ring.req_buf_sz = cfg->queue.req_buf_sz;
 	fc->ring.queue_buf_size = fc->ring.req_buf_sz * fc->ring.queue_depth;
+	spin_lock_init(&fc->ring.backgnd_qid_lock);
 
 	queue_sz = (sizeof(*fc->ring.queues) + req_sz);
 	fc->ring.queues = kcalloc(cfg->queue.nr_queues, queue_sz, GFP_KERNEL);
@@ -879,21 +969,15 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 		return -ENOMEM;
 	fc->ring.queue_size = queue_sz;
 
-	fc->ring.max_background = cfg->queue.max_background;
-
-	if (cfg->queue.max_background >= cfg->queue.queue_depth ||
-	   !cfg->queue.max_background) {
-		if (fc->ring.max_background == 0) {
-			pr_info("Invalid ring configuration, no background queue.\n");
-		} else
-			pr_info("Invalid ring configuration, "
-				"nr-background > nr-requests.\n");
-		return -EINVAL;
-	}
-
-	fc->ring.queue_refs = 0;
+	fc->ring.max_background = cfg->queue.backgnd_queue_depth;
 	fc->ring.max_foreground = cfg->queue.queue_depth -
-				  cfg->queue.max_background;
+				  cfg->queue.backgnd_queue_depth;
+
+	fc->ring.max_backgnd_aggr =
+		cfg->queue.max_backgnd_aggr ? cfg->queue.max_backgnd_aggr : 0;
+
+	fc->ring.backgnd_queue_cnt = 0;
+	fc->ring.queue_refs = 0;
 
 	return 0;
 }

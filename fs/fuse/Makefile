@@ -11,3 +11,5 @@ fuse-y := dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o d
 fuse-$(CONFIG_FUSE_DAX) += dax.o
 
 virtiofs-y := virtio_fs.o
+
+#CFLAGS_dev_uring.o := -DDEBUG -Og
