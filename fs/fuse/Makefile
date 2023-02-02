@@ -13,3 +13,4 @@ fuse-$(CONFIG_FUSE_DAX) += dax.o
 virtiofs-y := virtio_fs.o
 
 #CFLAGS_dev_uring.o := -DDEBUG -Og
+#CFLAGS_dev.o := -DDEBUG -Og

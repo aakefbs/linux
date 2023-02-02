@@ -2304,8 +2304,10 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	//FIXME
 	// wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 
-	if (fc->ring.queues != NULL)
-		wait_event(fc->ring.stop_waitq, fc->ring.queue_refs == 0);
+	if (fc->ring.queues != NULL) {
+		wait_event(fc->ring.stop_waitq,
+			   READ_ONCE(fc->ring.queue_refs) == 0);
+	}
 
 }
 
