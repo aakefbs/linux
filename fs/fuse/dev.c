@@ -60,7 +60,7 @@ static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags,
 {
 	struct fuse_conn *fc = fm->fc;
 
-	if (fc->ring.nr_queues > 0 && !no_uring)
+	if (fc->ring.configured && !no_uring)
 		return fuse_request_alloc_ring(fm, flags, for_background);
 	else
 		return fuse_request_alloc_mem(fm, flags);
@@ -520,6 +520,12 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 		atomic_inc(&fc->num_waiting);
 		req = fuse_request_alloc(fm, GFP_KERNEL | __GFP_NOFAIL,
 					 false, false);
+		if (unlikely(!req)) {
+			/* should only happen with uring on shutdown */
+			WARN_ON(!fc->ring.configured);
+			ret = -ENOMEM;
+			goto err;
+		}
 
 		if (!args->nocreds)
 			fuse_force_creds(req);
@@ -547,6 +553,7 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 	}
 	fuse_put_request(req);
 
+err:
 	return ret;
 }
 
