@@ -579,7 +579,7 @@ struct fuse_ring_queue {
 
 	struct fuse_conn *fc;
 
-	int q_id;
+	int qid;
 
 	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
 

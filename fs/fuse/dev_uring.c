@@ -445,8 +445,10 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 
 		if ((fc->ring.daemon->flags & PF_EXITING) ||
 		    !fiq->connected || fc->ring.stop_requested ||
-		    (current->flags & PF_EXITING))
-			break;
+		    (current->flags & PF_EXITING)) {
+			spin_unlock(&queue->waitq.lock);
+			queue = NULL;
+		}
 	}
 
 	return queue;
@@ -465,24 +467,14 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
 
 	/* returned queue is locked */
 	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
+	if (!queue)
+		return NULL;
 
 	pr_debug("%s:%d ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
 		"max-backgnd=%zu\n", __func__, __LINE__,
 		 queue->req_active_foreground, queue->req_active_background,
 		 fc->ring.max_foreground, fc->ring.max_background);
 
-	/* The conditions below require that neither fore- nor background
-	 * requests can take all queue entries
-	 */
-	if (!queue) {
-		if (for_background)
-			return NULL;
-		else {
-			/* something went wrong, not supposed to be NULL */
-			WARN_ON(1);
-			return NULL;
-		}
-	}
 
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
@@ -558,7 +550,7 @@ static bool _fuse_uring_free_req(struct fuse_conn *fc,
 
 	if (req->state & stop_state) {
 		req->state = FRRS_FREED;
-		pr_debug("releasing cmd qid=%d tag=%d\n", queue->q_id, req->tag);
+		pr_debug("releasing cmd qid=%d tag=%d\n", queue->qid, req->tag);
 		io_uring_cmd_done(req->cmd, -EIO, 0);
 		freed = true;
 	}
@@ -1000,7 +992,7 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 		return -EALREADY;
 	}
 
-	queue->q_id = qid;
+	queue->qid = qid;
 	queue->fc = fc;
 	queue->req_active_foreground = 0;
 	bitmap_zero(queue->req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
