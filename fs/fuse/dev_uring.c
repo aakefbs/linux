@@ -550,7 +550,6 @@ static bool _fuse_uring_free_req(struct fuse_conn *fc,
 
 	if (req->state & stop_state) {
 		req->state = FRRS_FREED;
-		pr_debug("releasing cmd qid=%d tag=%d\n", queue->qid, req->tag);
 		io_uring_cmd_done(req->cmd, -EIO, 0);
 		freed = true;
 	}
@@ -585,8 +584,14 @@ out:
 	spin_unlock(&queue->waitq.lock);
 
 	/* might free the queue - needs to have the queue waitq lock released */
-	if (can_free)
-		fc->ring.queue_refs--;
+	if (can_free) {
+		int refs = --fc->ring.queue_refs;
+		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
+			 fc, queue->qid, rreq->tag, refs);
+		if (refs == 0)
+			wake_up_locked(&fc->ring.stop_waitq);
+	}
+
 }
 
 /**
@@ -793,8 +798,6 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 {
 	unsigned qid;
 
-	pr_debug("%s: queue-refs=%d\n", __func__, fc->ring.queue_refs);
-
 	if (READ_ONCE(fc->ring.queue_refs) != 0) {
 		WARN_ON(1);
 		return;
@@ -862,7 +865,7 @@ static void fuse_dev_ring_stop_mon(struct work_struct *work)
 	    (fc->ring.daemon->flags & PF_EXITING))
 		fuse_uring_start_destruct(fc);
 
-	if (fc->ring.queue_refs > 0)
+	if (READ_ONCE(fc->ring.queue_refs) > 0)
 		schedule_delayed_work(&fc->ring.stop_monitor,
 				      FURING_DAEMON_MON_PERIOD);
 }
@@ -1029,8 +1032,6 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 	if (fc->ring.nr_queues_initialized == fc->ring.nr_queues)
 		fc->ring.configured = 1;
 
-	pr_debug("%s Queue-refs=%d\n", __func__, fc->ring.queue_refs);
-
 	return 0;
 }
 
@@ -1108,11 +1109,11 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 	if (fud == NULL)
 		return -ENODEV;
 
-	pr_debug("%s flags=%llx qid=%d nq=%d  qdepth=%d\n",
-		 __func__, cfg->flags, cfg->queue.qid, cfg->queue.nr_queues,
+	fc = fud->fc;
+	pr_debug("%s fc=%p flags=%llx qid=%d nq=%d  qdepth=%d\n",
+		 __func__, fc, cfg->flags, cfg->queue.qid, cfg->queue.nr_queues,
 		 cfg->queue.queue_depth);
 
-	fc = fud->fc;
 
 	if (cfg->flags & FUSE_URING_IOCTL_FLAG_QUEUE_CFG) {
 		/* config flag is incompatible to WAIT and STOP */
