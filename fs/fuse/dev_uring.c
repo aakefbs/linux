@@ -570,6 +570,11 @@ __must_hold(&fc->ring.stop_waitq.lock)
 		goto out; /* no work left, freed in another code path */
 
 	if (rreq->state == FRRS_USERSPACE) {
+
+		/* Not always done yet on shutdown */
+		clear_bit(FR_PENDING, &req->flags);
+		set_bit(FR_SENT, &req->flags);
+
 		rreq->state = FRRS_FREEING;
 		spin_unlock(&queue->waitq.lock);
 		fuse_request_end(&rreq->req);
