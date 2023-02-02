@@ -557,6 +557,9 @@ static bool _fuse_uring_free_req(struct fuse_conn *fc,
 	return freed;
 }
 
+/*
+ * This is called on shutdown
+ */
 static void fuse_uring_free_req(struct fuse_conn *fc,
 				struct fuse_ring_queue *queue,
 				struct fuse_ring_req *rreq)
@@ -570,6 +573,11 @@ __must_hold(&fc->ring.stop_waitq.lock)
 		goto out; /* no work left, freed in another code path */
 
 	if (rreq->state == FRRS_USERSPACE) {
+		struct fuse_req *req = &rreq->req;
+
+		/* ensure there is an error set, to avoid using invalid data */
+		if (req->out.h.error == 0)
+			req->out.h.error = -EINTR;
 
 		/* Not always done yet on shutdown */
 		clear_bit(FR_PENDING, &req->flags);
@@ -577,7 +585,7 @@ __must_hold(&fc->ring.stop_waitq.lock)
 
 		rreq->state = FRRS_FREEING;
 		spin_unlock(&queue->waitq.lock);
-		fuse_request_end(&rreq->req);
+		fuse_request_end(req);
 		spin_lock(&queue->waitq.lock);
 	} else
 		can_free = _fuse_uring_free_req(fc, queue, rreq);
