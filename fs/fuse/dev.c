@@ -61,7 +61,7 @@ static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags,
 	struct fuse_conn *fc = fm->fc;
 
 	if (fc->ring.configured && !no_uring)
-		return fuse_request_alloc_ring(fm, flags, for_background);
+		return fuse_request_alloc_ring(fm, for_background);
 	else
 		return fuse_request_alloc_mem(fm, flags);
 }

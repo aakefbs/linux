@@ -454,7 +454,7 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 	return queue;
 }
 
-struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm, gfp_t flags,
+struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 					 bool for_background)
 {
 	struct fuse_conn *fc = fm->fc;
