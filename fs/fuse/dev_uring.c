@@ -59,14 +59,14 @@ static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
 	cs.ring.len = max_buf;
 	cs.req = req;
 
-	pr_debug("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
+	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
 		 cs.ring.buf, cs.ring.len, args->out_numargs);
 
 	err = fuse_copy_args(&cs, args->in_numargs, args->in_pages,
 			     (struct fuse_arg *) args->in_args, 0);
 	buf_req->in_out_arg_len = cs.ring.offset;
 
-	pr_debug("%s:%d buf=%p len=%d args=%d err=%d\n", __func__, __LINE__,
+	pr_devel("%s:%d buf=%p len=%d args=%d err=%d\n", __func__, __LINE__,
 		 cs.ring.buf, cs.ring.len, args->out_numargs, err);
 
 	return err;
@@ -85,7 +85,7 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
 	cs.ring.buf = buf_req->in_out_arg;
 
 	if (buf_req->in_out_arg_len > max_buf) {
-		pr_debug("Max ring buffer len exceeded (%u vs %zu\n",
+		pr_devel("Max ring buffer len exceeded (%u vs %zu\n",
 			 buf_req->in_out_arg_len, max_buf);
 		return -EINVAL;
 	}
@@ -93,7 +93,7 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
 
 	cs.req = req;
 
-	pr_debug("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
+	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
 		 cs.ring.buf, cs.ring.len, args->out_numargs);
 
 	return copy_out_args(&cs, args, buf_req->in_out_arg_len);
@@ -111,8 +111,8 @@ int fuse_dev_uring_write_to_ring(struct fuse_ring_req *ring_req)
 	struct fuse_req *req = &ring_req->req;
 	int err = -EIO;
 
-	pr_debug("%s:%d Here ring-req=%p buf_req=%p state=%lu args=%p \n",
-		 __func__, __LINE__, ring_req, buf_req, ring_req->state, req->args);
+	pr_devel("%s:%d ring-req=%p buf_req=%p state=%lu args=%p \n", __func__,
+		 __LINE__, ring_req, buf_req, ring_req->state, req->args);
 
 	if (READ_ONCE(ring_req->state) != FRRS_REQ) {
 		WARN_RATELIMIT(1, "Invalid ring-req state: %lu\n",
@@ -131,7 +131,7 @@ int fuse_dev_uring_write_to_ring(struct fuse_ring_req *ring_req)
 	 * though */
 	buf_req->in = req->in.h;
 
-	pr_debug("%s cmd-done op=%d unique=%llu\n",
+	pr_devel("%s cmd-done op=%d unique=%llu\n",
 		__func__, buf_req->in.opcode, buf_req->in.unique);
 
 	clear_bit(FR_PENDING, &req->flags);
@@ -188,7 +188,7 @@ static int fuse_dev_uring_ring_has_err(struct fuse_conn *fc,
 
 	if (oh->error) {
 		err = oh->error;
-		pr_debug("%s:%d err=%d op=%d req-ret=%d",
+		pr_devel("%s:%d err=%d op=%d req-ret=%d",
 			 __func__, __LINE__, err, req->args->opcode,
 			 req->out.h.error);
 		goto err; /* error already set */
@@ -222,12 +222,12 @@ static int fuse_dev_uring_ring_has_err(struct fuse_conn *fc,
 	return 0;
 
 seterr:
-	pr_debug("%s:%d err=%d op=%d req-ret=%d",
+	pr_devel("%s:%d err=%d op=%d req-ret=%d",
 		 __func__, __LINE__, err, req->args->opcode,
 		 req->out.h.error);
 	oh->error = err;
 err:
-	pr_debug("%s:%d err=%d op=%d req-ret=%d",
+	pr_devel("%s:%d err=%d op=%d req-ret=%d",
 		 __func__, __LINE__, err, req->args->opcode,
 		 req->out.h.error);
 	return err;
@@ -244,7 +244,7 @@ void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
 	struct fuse_req *req = &ring_req->req;
 	ssize_t err = 0;
 
-	pr_debug("%s:%d req=%p\n", __func__, __LINE__, req);
+	pr_devel("%s:%d req=%p\n", __func__, __LINE__, req);
 
 	clear_bit(FR_SENT, &req->flags);
 
@@ -252,7 +252,7 @@ void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
 
 	err = fuse_dev_uring_ring_has_err(fud->fc, ring_req);
 	if (err) {
-		pr_debug("%s:%d err=%zd oh->err=%d \n", __func__, __LINE__,
+		pr_devel("%s:%d err=%zd oh->err=%d \n", __func__, __LINE__,
 			 err, req->out.h.error);
 		goto out;
 	}
@@ -262,7 +262,7 @@ void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
 		goto seterr;
 
 out:
-	pr_debug("%s:%d ret=%zd op=%d req-ret=%d",
+	pr_devel("%s:%d ret=%zd op=%d req-ret=%d",
 		 __func__, __LINE__, err, req->args->opcode, req->out.h.error);
 	if (ring_req->req_ptr) {
 		*ring_req->req_ptr = *req;
@@ -323,7 +323,7 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 	ring_req->req = *q_req;
 	ring_req->req_ptr = q_req;
 
-	pr_debug("%s: args=%p ring-args=%p req=%p list-req=%p\n",
+	pr_devel("%s: args=%p ring-args=%p req=%p list-req=%p\n",
 		 __func__, q_req->args, ring_req->req.args, &ring_req->req, q_req);
 
 	rc = fuse_dev_uring_write_to_ring(ring_req);
@@ -386,7 +386,7 @@ fuse_dev_uring_queue_for_background_req(struct fuse_conn *fc)
 			/* no need to wait for background requests, the caller
 			 * can handle request allocation failures
 			 */
-			pr_debug("%s Active bgnd=%d max-bnd=%zu\n", __func__,
+			pr_devel("%s Active bgnd=%d max-bnd=%zu\n", __func__,
 				 queue->req_active_background,
 				 fc->ring.max_background);
 			spin_unlock(&queue->waitq.lock);
@@ -425,12 +425,10 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 
 	if (for_background && fc->ring.per_core_queue) {
 		/* more complex handling, for coalescencing */
-		pr_devel("%s:%d here\n", __func__, __LINE__);
 		return fuse_dev_uring_queue_for_background_req(fc);
 	}
 
 	if (fc->ring.per_core_queue) {
-		pr_devel("%s:%d here\n", __func__, __LINE__);
 		qid = task_cpu(current);
 		if (unlikely(qid) >= fc->ring.nr_queues) {
 			WARN_ONCE(1, "Core number (%u) exceeds nr of ring "
@@ -439,7 +437,6 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 		}
 	}
 
-	pr_devel("%s:%d here\n", __func__, __LINE__);
 	queue = fuse_uring_get_queue(fc, qid);
 	spin_lock(&queue->waitq.lock);
 
@@ -519,7 +516,7 @@ again:
 
 
 	req = &ring_req->req;
-	pr_debug("queue bit op fc=%p qid=%d tag=%d -> 0\n",
+	pr_devel("queue bit op fc=%p qid=%d tag=%d -> 0\n",
 		fc, queue->qid, ring_req->tag);
 	__clear_bit(tag, queue->req_avail_map);
 
@@ -532,7 +529,7 @@ out:
 		__set_bit(FR_URING, &req->flags);
 	}
 
-	pr_debug("%s: tag=%d cnt=%llu req=%p background=%d\n",
+	pr_devel("%s: tag=%d cnt=%llu req=%p background=%d\n",
 		 __func__, tag, req_cnt, req, for_background);
 
 	return req;
@@ -638,7 +635,7 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 
 	ring_req->state = FRRS_WAITING;
 
-	pr_debug("queue bit op fc=%p qid=%d tag=%d -> 1\n",
+	pr_devel("queue bit op fc=%p qid=%d tag=%d -> 1\n",
 		 fc, queue->qid, ring_req->tag);
 
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
@@ -709,14 +706,14 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	}
 	ring_req = &queue->ring_req[cmd_req->tag];
 
-	pr_debug("%s:%d received: cmd op %d queue %d (%p) tag %d  (%p)\n",
+	pr_devel("%s:%d received: cmd op %d queue %d (%p) tag %d  (%p)\n",
 		 __func__, __LINE__,
 		 cmd_op, cmd_req->q_id, queue, cmd_req->tag, ring_req);
 
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
 		if (READ_ONCE(ring_req->state) != FRRS_INIT) {
-			pr_debug("%s: q_id: %d tag: %d invalid req state: %lu\n",
+			pr_devel("%s: q_id: %d tag: %d invalid req state: %lu\n",
 				 __func__, cmd_req->q_id, cmd_req->tag,
 				 ring_req->state);
 			goto out;
@@ -726,7 +723,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 		ret = fuse_dev_uring_fetch_queued(fc, queue, ring_req);
 		if (ret >= 0) {
-			pr_debug("%s tag=%d req=%p list-req=%p bgnd=%d\n",
+			pr_devel("%s tag=%d req=%p list-req=%p bgnd=%d\n",
 				 __func__, ring_req->tag,
 				 &ring_req->req, ring_req->req_ptr,
 				 test_bit(FR_BACKGROUND, &ring_req->req.flags));
@@ -739,7 +736,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 				queue->req_active_background++;
 			else {
 				queue->req_active_foreground++;
-				pr_debug("%s:%d ac-foregnd=%d\n", __func__, __LINE__,
+				pr_devel("%s:%d ac-foregnd=%d\n", __func__, __LINE__,
 					 queue->req_active_foreground);
 			}
 			spin_unlock(&queue->waitq.lock);
@@ -757,7 +754,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
 		if (READ_ONCE(ring_req->state) != FRRS_USERSPACE) {
-			pr_debug("Invalid request state %lu, expected %d \n",
+			pr_devel("Invalid request state %lu, expected %d \n",
 				ring_req->state, FRRS_USERSPACE);
 
 			/* check if shutdown is in process and the request
@@ -777,11 +774,11 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		break;
 	default:
 		ret = -EINVAL;
-		pr_debug("Unknown uring command %d", cmd_op);
+		pr_devel("Unknown uring command %d", cmd_op);
 		goto out;
 	}
 
-	pr_debug("%s:%d ret=%d", __func__, __LINE__, ret);
+	pr_devel("%s:%d ret=%d", __func__, __LINE__, ret);
 
 out:
 	if (ret < 0) {
@@ -798,10 +795,10 @@ out:
 
 	if (ret < 0) {
 		io_uring_cmd_done(cmd, ret, 0);
-		pr_debug("%s: req error: op=%d, tag=%d ret=%d io_flags=%x\n",
+		pr_devel("%s: req error: op=%d, tag=%d ret=%d io_flags=%x\n",
 			__func__, cmd_op, cmd_req->tag, ret, issue_flags);
 	} else {
-		pr_debug("%s: %s cmd op %d queue %d tag %d result %d\n",
+		pr_devel("%s: %s cmd op %d queue %d tag %d result %d\n",
 			 __func__, ret == 0 ? "req ring queued" : "req sent back",
 			cmd_op, cmd_req->q_id, cmd_req->tag, ret);
 
@@ -1039,7 +1036,7 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 		req->kbuf = (struct fuse_uring_buf_req *)(queue->queue_req_buf +
 				fc->ring.req_buf_sz * tag);
 
-		pr_debug("initialize qid=%d tag=%d queue=%p req=%p",
+		pr_devel("initialize qid=%d tag=%d queue=%p req=%p",
 			 qid, tag, queue, req);
 
 		req->kbuf->flags = 0;
@@ -1131,7 +1128,7 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 		return -ENODEV;
 
 	fc = fud->fc;
-	pr_debug("%s fc=%p flags=%llx qid=%d nq=%d  qdepth=%d\n",
+	pr_devel("%s fc=%p flags=%llx qid=%d nq=%d  qdepth=%d\n",
 		 __func__, fc, cfg->flags, cfg->queue.qid, cfg->queue.nr_queues,
 		 cfg->queue.queue_depth);
 
@@ -1181,7 +1178,7 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	if (sz != fc->ring.queue_buf_size) {
 		ret = -EINVAL;
-		pr_debug("mmap size mismatch, expected %zu got %zu\n",
+		pr_devel("mmap size mismatch, expected %zu got %zu\n",
 			 fc->ring.queue_buf_size, sz);
 		goto out;
 	}
@@ -1195,13 +1192,13 @@ int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 	queue = fuse_uring_get_queue(fc, qid);
 
 	if (queue == NULL) {
-		pr_debug("fuse uring mmap: invalid qid=%u\n", qid);
+		pr_devel("fuse uring mmap: invalid qid=%u\n", qid);
 		return -ERANGE;
 	}
 
 	ret = remap_vmalloc_range(vma, queue->queue_req_buf, 0);
 out:
-	pr_debug("%s: pid %d qid: %u addr: %p sz: %zu  ret: %d\n",
+	pr_devel("%s: pid %d qid: %u addr: %p sz: %zu  ret: %d\n",
 		 __func__, current->pid, qid, (char *)vma->vm_start,
 		 sz, ret);
 
