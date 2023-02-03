@@ -397,6 +397,10 @@ fuse_dev_uring_queue_for_background_req(struct fuse_conn *fc)
 		retries++;
 	}
 
+	pr_devel("background get-queue: qid %d->%d cnt %d->%d\n",
+		 fc->ring.background_qid, qid, fc->ring.backgnd_queue_cnt, cnt);
+
+
 	fc->ring.background_qid = qid;
 	fc->ring.backgnd_queue_cnt = cnt;
 
@@ -438,10 +442,10 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 	pr_devel("%s:%d here\n", __func__, __LINE__);
 	queue = fuse_uring_get_queue(fc, qid);
 	spin_lock(&queue->waitq.lock);
-	/* foreground waits until there is space in the queue */
-	while (queue->req_active_foreground >= fc->ring.max_foreground) {
-		wait_event_interruptible_exclusive_locked
-			(queue->waitq, (queue->req_active_foreground > 0));
+
+	if (queue->req_active_foreground >= fc->ring.max_foreground) {
+		wait_event_interruptible_exclusive_locked(queue->waitq,
+			queue->req_active_foreground < fc->ring.max_foreground);
 
 		if ((fc->ring.daemon->flags & PF_EXITING) ||
 		    !fiq->connected || fc->ring.stop_requested ||
@@ -465,12 +469,14 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	unsigned int tag = -1;
 	const size_t queue_depth = fc->ring.queue_depth;
 
+	pr_devel("%s:%d backgnd=%d\n", __func__, __LINE__, for_background);
+
 	/* returned queue is locked */
 	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
 	if (!queue)
 		return NULL;
 
-	pr_debug("%s:%d ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
+	pr_devel("%s:%d ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
 		"max-backgnd=%zu\n", __func__, __LINE__,
 		 queue->req_active_foreground, queue->req_active_background,
 		 fc->ring.max_foreground, fc->ring.max_background);
@@ -617,6 +623,7 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 	struct fuse_ring_queue *queue = ring_req->queue;
 	struct fuse_conn *fc = queue->fc;
 	int old_state;
+	bool backgnd = !!(ring_req->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
 
 	spin_lock(&queue->waitq.lock);
 
@@ -629,28 +636,24 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 
 	ring_req->state = FRRS_WAITING;
 
-	pr_debug("%s: tag=%d req=%p backgnd=%llu\n",
-		 __func__, ring_req->tag, req,
-		 ring_req->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
-
-	/* Note: the bit in req->flag got already cleared in fuse_request_end */
-	if (ring_req->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND)
-		queue->req_active_background--;
-	else {
-		queue->req_active_foreground--;
-	}
-
-	ring_req->kbuf->flags = 0;
-
 	pr_debug("queue bit op fc=%p qid=%d tag=%d -> 1\n",
 		 fc, queue->qid, ring_req->tag);
 
+	/* Note: the bit in req->flag got already cleared in fuse_request_end */
+	ring_req->kbuf->flags = 0;
 	__set_bit(ring_req->tag, queue->req_avail_map);
-	wake_up_locked(&queue->waitq);
+
+	if (backgnd)
+		queue->req_active_background--;
+	else {
+		queue->req_active_foreground--;
+		wake_up_locked(&queue->waitq);
+	}
+
 out:
 	spin_unlock(&queue->waitq.lock);
 
-	if (fc->ring.stop_requested)
+	if (unlikely(fc->ring.stop_requested))
 		schedule_delayed_work(&fc->ring.stop_monitor, 0);
 
 }
