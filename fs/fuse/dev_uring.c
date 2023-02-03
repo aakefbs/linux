@@ -469,6 +469,7 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	unsigned int tag = -1;
 	const size_t queue_depth = fc->ring.queue_depth;
 
+again:
 	pr_devel("%s:%d backgnd=%d\n", __func__, __LINE__, for_background);
 
 	/* returned queue is locked */
@@ -490,11 +491,12 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 			queue->req_active_foreground,
 			queue->req_active_background,
 			fc->ring.max_foreground, fc->ring.max_background);
-		WARN_ON(1);
-		goto out;
-	}
 
-	pr_devel("%s:%d here\n", __func__, __LINE__);
+		/* XXX run fstests generic/029 and generic/030 */
+		WARN_ON(1);
+		spin_unlock(&queue->waitq.lock);
+		goto again;
+	}
 
 	ring_req = &queue->ring_req[tag];
 	if (unlikely(ring_req->state != FRRS_WAITING)) {
@@ -641,6 +643,9 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
 	ring_req->kbuf->flags = 0;
+
+
+	/* XXX: Split the map into two, makes debugging easier */
 	__set_bit(ring_req->tag, queue->req_avail_map);
 
 	if (backgnd)
