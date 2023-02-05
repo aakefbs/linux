@@ -463,7 +463,7 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	struct fuse_ring_req *ring_req;
 	struct fuse_req *req = NULL;
 	uint64_t req_cnt;
-	unsigned int tag = -1;
+	unsigned int tag = -1, old;
 	const size_t queue_depth = fc->ring.queue_depth;
 
 again:
@@ -483,14 +483,15 @@ again:
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
 		pr_info("ring: no free bit found for qid=%d backgnd=%d "
-			"ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
+			"qdepth=%zu ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
 			"max-backgnd=%zu\n", queue->qid, for_background,
+			queue_depth,
 			queue->req_active_foreground,
 			queue->req_active_background,
 			fc->ring.max_foreground, fc->ring.max_background);
 
-		/* XXX run fstests generic/029 and generic/030 */
-		WARN_ON(1);
+		/* XXX What happens here`
+		WARN_ON(1); */
 		spin_unlock(&queue->waitq.lock);
 		goto again;
 	}
@@ -518,7 +519,12 @@ again:
 	req = &ring_req->req;
 	pr_devel("queue bit op fc=%p qid=%d tag=%d -> 0\n",
 		fc, queue->qid, ring_req->tag);
-	__clear_bit(tag, queue->req_avail_map);
+	old = test_and_clear_bit(tag, queue->req_avail_map);
+	if (unlikely(old != 1)) {
+		pr_warn("invalid bit value on clear for qid=%d tag=%d",
+			queue->qid, tag);
+		WARN_ON(1);
+	}
 
 out:
 	spin_unlock(&queue->waitq.lock);
@@ -621,12 +627,12 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 		container_of(req, struct fuse_ring_req, req);
 	struct fuse_ring_queue *queue = ring_req->queue;
 	struct fuse_conn *fc = queue->fc;
-	int old_state;
+	int prev_state, prev_bit_val;
 	bool backgnd = !!(ring_req->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
 
 	spin_lock(&queue->waitq.lock);
 
-	old_state = ring_req->state;
+	prev_state = ring_req->state;
 	if (ring_req->state != FRRS_USERSPACE &&
 	    ring_req->state != FRRS_FREEING) {
 		WARN(1, "Invalid req old_state: %lu\n", ring_req->state);
@@ -643,7 +649,12 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 
 
 	/* XXX: Split the map into two, makes debugging easier */
-	__set_bit(ring_req->tag, queue->req_avail_map);
+	prev_bit_val = test_and_set_bit(ring_req->tag, queue->req_avail_map);
+	if (unlikely(prev_bit_val != 0)) {
+		pr_warn("invalid bit value on set for qid=%d tag=%d",
+			queue->qid, ring_req->tag);
+		WARN_ON(prev_bit_val != 0);
+	}
 
 	if (backgnd)
 		queue->req_active_background--;
@@ -1016,7 +1027,8 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 	queue->qid = qid;
 	queue->fc = fc;
 	queue->req_active_foreground = 0;
-	bitmap_zero(queue->req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
+	bitmap_zero(queue->req_avail_map, fc->ring.queue_depth);
+	smp_mb__before_atomic();
 	init_waitqueue_head(&queue->waitq);
 
 	queue->queue_req_buf =
