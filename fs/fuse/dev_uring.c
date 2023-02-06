@@ -480,6 +480,7 @@ again:
 		 fc->ring.max_foreground, fc->ring.max_background);
 
 
+	smp_mb__before_atomic();
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
 		pr_info("ring: no free bit found for qid=%d backgnd=%d "
@@ -591,8 +592,9 @@ __must_hold(&fc->ring.stop_waitq.lock)
 			req->out.h.error = -EINTR;
 
 		/* Not always done yet on shutdown */
-		clear_bit(FR_PENDING, &req->flags);
-		set_bit(FR_SENT, &req->flags);
+		__clear_bit(FR_PENDING, &req->flags);
+		__clear_bit(FR_SENT, &req->flags);
+		__set_bit(FR_URING, &req->flags);
 
 		rreq->state = FRRS_FREEING;
 		spin_unlock(&queue->waitq.lock);
@@ -646,7 +648,6 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
 	ring_req->kbuf->flags = 0;
-
 
 	/* XXX: Split the map into two, makes debugging easier */
 	prev_bit_val = test_and_set_bit(ring_req->tag, queue->req_avail_map);
