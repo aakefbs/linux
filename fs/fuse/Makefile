@@ -14,3 +14,5 @@ virtiofs-y := virtio_fs.o
 
 #CFLAGS_dev_uring.o := -DDEBUG -Og
 #CFLAGS_dev.o := -DDEBUG -Og
+CFLAGS_dev_uring.o := -Og
+CFLAGS_dev.o := -Og
