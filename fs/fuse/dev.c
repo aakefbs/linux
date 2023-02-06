@@ -242,8 +242,6 @@ __releases(fiq->lock)
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
-
 	if (test_bit(FR_URING, &req->flags)) {
 		struct fuse_ring_req *ring_req =
 			container_of(req, struct fuse_ring_req, req);
@@ -254,7 +252,7 @@ __releases(fiq->lock)
 		pr_debug("%s req=%p ring_req=%p &ring_req->req=%p",
 			 __func__, req, ring_req, &ring_req->req);
 
-		fuse_dev_uring_write_to_ring(ring_req);
+		fuse_dev_uring_send_to_ring(ring_req);
 	} else {
 
 		pr_debug("List queuing request\n");
@@ -576,7 +574,7 @@ static void fuse_request_send_background_uring(struct fuse_conn *fc,
 	spin_unlock(&fc->bg_lock);
 
 	req->in.h.unique = fuse_get_unique(fiq);
-	fuse_dev_uring_write_to_ring(ring_req);
+	fuse_dev_uring_send_to_ring(ring_req);
 }
 
 static bool fuse_request_queue_background(struct fuse_req *req)
@@ -1918,7 +1916,7 @@ int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 	if (!cs->is_uring)
 		reqsize = sizeof(struct fuse_out_header);
 
-	pr_debug("%s:%d args=%p out-num=%u\n", __func__, __LINE__,
+	pr_devel("%s:%d args=%p out-num=%u\n", __func__, __LINE__,
 		 args, args->out_numargs);
 
 	reqsize += fuse_len_args(args->out_numargs, args->out_args);
@@ -1939,8 +1937,6 @@ int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		pr_debug("%s:%d reqsize=%u nbytes=%u\n", __func__, __LINE__,
 			 reqsize, nbytes);
 	}
-
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
 
 	return fuse_copy_args(cs, args->out_numargs, args->out_pages,
 			      args->out_args, args->page_zeroing);
