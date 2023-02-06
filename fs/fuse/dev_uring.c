@@ -44,6 +44,42 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 	return (struct fuse_ring_queue *)(ptr + qid * fc->ring.queue_size);
 }
 
+static void
+fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
+{
+	struct fuse_req *req = &ring_req->req;
+	bool already = false;
+
+	spin_lock(&ring_req->queue->waitq.lock);
+	if (ring_req->state & FRRS_FUSE_REQ_END)
+		already = true;
+	else
+		ring_req->state |= FRRS_FUSE_REQ_END;
+	spin_unlock(&ring_req->queue->waitq.lock);
+
+	if (already) {
+		WARN_ON(1);
+		return;
+	}
+
+	if (set_err)
+		req->out.h.error = error;
+
+	if (ring_req->req_ptr) {
+		*ring_req->req_ptr = *req;
+		fuse_request_end(ring_req->req_ptr);
+		ring_req->req_ptr = NULL;
+
+		/* release the ring req, typically it is done through
+		 * fuse_request_end, but here the fuse req is just an
+		 * attached pointer - we need to release the ring-request
+		 * on our on own */
+		fuse_dev_uring_req_release(&ring_req->req);
+	}
+	else
+		fuse_request_end(req);
+}
+
 static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
 				   struct fuse_req *req,
 				   struct fuse_uring_buf_req *buf_req)
@@ -104,68 +140,54 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
  * userspace will read it
  * This is comparable with classical read(/dev/fuse)
  */
-int fuse_dev_uring_write_to_ring(struct fuse_ring_req *ring_req)
+int fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req)
 {
 	struct fuse_conn *fc = ring_req->queue->fc;
 	struct fuse_uring_buf_req *buf_req = ring_req->kbuf;
 	struct fuse_req *req = &ring_req->req;
-	int err = -EIO;
+	int err = 0;
 
 	pr_devel("%s:%d ring-req=%p buf_req=%p state=%lu args=%p \n", __func__,
 		 __LINE__, ring_req, buf_req, ring_req->state, req->args);
 
-	if (READ_ONCE(ring_req->state) != FRRS_REQ) {
-		WARN_RATELIMIT(1, "Invalid ring-req state: %lu\n",
-				ring_req->state);
-		goto err;
+	spin_lock(&ring_req->queue->waitq.lock);
+	if (unlikely((ring_req->state & FRRS_USERSPACE) ||
+		     (ring_req->state & FRRS_FREED))) {
+		pr_err("ring-req=%p buf_req=%p invalid state %lu on send\n",
+		       ring_req, buf_req, ring_req->state);
+		WARN_ON(1);
+		err = -EIO;
 	}
+	else
+		ring_req->state |= FRRS_USERSPACE;
+	spin_unlock(&ring_req->queue->waitq.lock);
+	if (err)
+		goto err;
 
 	err = fuse_uring_copy_to_ring(fc, req, buf_req);
 	if (err)
 		goto err;
 
-	/* ring req go directly into the shared memory buffer
-	 *
-	 * XXX avoid this have the data for uring immediately in the
-	 * shared userspace buffer. Lots of if-conditions in the code,
-	 * though */
+	/* ring req go directly into the shared memory buffer */
 	buf_req->in = req->in.h;
 
 	pr_devel("%s cmd-done op=%d unique=%llu\n",
 		__func__, buf_req->in.opcode, buf_req->in.unique);
 
-	clear_bit(FR_PENDING, &req->flags);
-	set_bit(FR_SENT, &req->flags);
-
-	spin_lock(&ring_req->queue->waitq.lock);
-	ring_req->state = FRRS_USERSPACE;
-	spin_unlock(&ring_req->queue->waitq.lock);
 	io_uring_cmd_done(ring_req->cmd, 0, 0);
 
 	return 0;
 
 err:
-	req->out.h.error = -EIO;
-	if (ring_req->req_ptr) {
-		*ring_req->req_ptr = *req;
-		fuse_request_end(ring_req->req_ptr);
-		ring_req->req_ptr = NULL;
-
-		/* release the ring req, as if it has done work */
-		WRITE_ONCE(ring_req->state, FRRS_USERSPACE);
-		fuse_dev_uring_req_release(&ring_req->req);
-	}
-	else
-		fuse_request_end(req);
-
+	fuse_uring_request_end(ring_req, true, err);
 	return err;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_uring_write_to_ring);
+EXPORT_SYMBOL_GPL(fuse_dev_uring_send_to_ring);
 
 /*
  * Checks for errors and stores it into the request
  */
-static int fuse_dev_uring_ring_has_err(struct fuse_conn *fc,
+static int fuse_dev_uring_ring_req_has_err(struct fuse_conn *fc,
 				       struct fuse_ring_req *ring_req)
 {
 	struct fuse_req *req = &ring_req->req;
@@ -235,23 +257,24 @@ err:
 
 /**
  * Read data from the ring buffer, which user space has written to
- * This is comparible with classical write(/dev/fuse)
+ * This is comparible with classical write(/dev/fuse) and also make the ring
+ * request available again
  */
-void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
-				   struct fuse_ring_req *ring_req)
+static void fuse_dev_uring_commit_and_release(struct fuse_dev *fud,
+					  struct fuse_ring_req *ring_req)
 {
 	struct fuse_uring_buf_req *buf_req = ring_req->kbuf;
 	struct fuse_req *req = &ring_req->req;
 	ssize_t err = 0;
+	bool set_err = false;
 
 	pr_devel("%s:%d req=%p\n", __func__, __LINE__, req);
 
-	clear_bit(FR_SENT, &req->flags);
-
 	req->out.h = buf_req->out;
 
-	err = fuse_dev_uring_ring_has_err(fud->fc, ring_req);
+	err = fuse_dev_uring_ring_req_has_err(fud->fc, ring_req);
 	if (err) {
+		/* req->out.h.error already set */
 		pr_devel("%s:%d err=%zd oh->err=%d \n", __func__, __LINE__,
 			 err, req->out.h.error);
 		goto out;
@@ -259,28 +282,14 @@ void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
 
 	err = fuse_uring_copy_from_ring(fud->fc, req, buf_req);
 	if (err)
-		goto seterr;
+		set_err = true;
 
 out:
 	pr_devel("%s:%d ret=%zd op=%d req-ret=%d",
 		 __func__, __LINE__, err, req->args->opcode, req->out.h.error);
-	if (ring_req->req_ptr) {
-		*ring_req->req_ptr = *req;
-		fuse_request_end(ring_req->req_ptr);
-		ring_req->req_ptr = NULL;
-
-		/* the ring req is available now */
-		fuse_dev_uring_req_release(&ring_req->req);
-	}
-	else
-		fuse_request_end(&ring_req->req);
+	fuse_uring_request_end(ring_req, set_err, err);
 	return;
-
-seterr:
-	req->out.h.error = err;
-	goto out;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_uring_read_from_ring);
 
 /**
  * Check if an application command was queued into the list-queue
@@ -290,17 +299,13 @@ EXPORT_SYMBOL_GPL(fuse_dev_uring_read_from_ring);
  *
  * negative values for error
  */
-static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
-				       struct fuse_ring_queue *queue,
-				       struct fuse_ring_req *ring_req)
+static int fuse_dev_uring_fetch_send_queued(struct fuse_conn *fc,
+					    struct fuse_ring_queue *queue,
+					    struct fuse_ring_req *ring_req)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 	struct fuse_req *q_req = NULL;
-	int rc, ret = 0;
-
-	spin_lock(&queue->waitq.lock);
-	ring_req->state = FRRS_REQ;
-	spin_unlock(&queue->waitq.lock);
+	int ret;
 
 	spin_lock(&fiq->lock);
 	if (!list_empty(&fiq->pending)) {
@@ -311,7 +316,7 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 	spin_unlock(&fiq->lock);
 
 	if (!q_req)
-		goto out;
+		return 0; /* no request to handle */
 
 	ring_req->kbuf->flags = 0;
 
@@ -326,25 +331,16 @@ static int fuse_dev_uring_fetch_queued(struct fuse_conn *fc,
 	pr_devel("%s: args=%p ring-args=%p req=%p list-req=%p\n",
 		 __func__, q_req->args, ring_req->req.args, &ring_req->req, q_req);
 
-	rc = fuse_dev_uring_write_to_ring(ring_req);
-	if (rc) {
-		if (unlikely(rc == -ENOENT)) {
-			/* ENOENT is specially treated by the caller,
-			 * as no reqest in the list, so must not be used here */
-			rc = -EIO;
+	ret = fuse_dev_uring_send_to_ring(ring_req);
+	if (ret) {
+		if (unlikely(ret > 0)) {
+			WARN(1, "Unexpected return code: %d", ret);
+			ret = -EIO;
 		}
-
-		if (rc > 0) {
-			WARN(1, "Unexpected return code: %d", rc);
-			rc = -EIO;
-		}
-
-		ret = rc;
 	}
+	else
+		ret = 1; /* request handled */
 
-	ret = rc != 0 ? rc : 1;
-
-out:
 	return ret;
 }
 
@@ -425,7 +421,8 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 
 	if (for_background && fc->ring.per_core_queue) {
 		/* more complex handling, for coalescencing */
-		return fuse_dev_uring_queue_for_background_req(fc);
+		queue = fuse_dev_uring_queue_for_background_req(fc);
+		goto out;
 	}
 
 	if (fc->ring.per_core_queue) {
@@ -443,13 +440,14 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 	if (queue->req_active_foreground >= fc->ring.max_foreground) {
 		wait_event_interruptible_exclusive_locked(queue->waitq,
 			queue->req_active_foreground < fc->ring.max_foreground);
+	}
 
-		if ((fc->ring.daemon->flags & PF_EXITING) ||
-		    !fiq->connected || fc->ring.stop_requested ||
-		    (current->flags & PF_EXITING)) {
-			spin_unlock(&queue->waitq.lock);
-			queue = NULL;
-		}
+out:
+	if (unlikely((fc->ring.daemon->flags & PF_EXITING) ||
+	    !fiq->connected || fc->ring.stop_requested ||
+	    (current->flags & PF_EXITING)) || queue->stop_requested) {
+		spin_unlock(&queue->waitq.lock);
+		queue = NULL;
 	}
 
 	return queue;
@@ -465,20 +463,18 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	uint64_t req_cnt;
 	unsigned int tag = -1, old;
 	const size_t queue_depth = fc->ring.queue_depth;
+	bool again = false;
 
 again:
-	pr_devel("%s:%d backgnd=%d\n", __func__, __LINE__, for_background);
+	pr_info("%s:%d backgnd=%d again=%d\n",
+		__func__, __LINE__, for_background, again);
 
 	/* returned queue is locked */
 	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
 	if (!queue)
 		return NULL;
 
-	pr_devel("%s:%d ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
-		"max-backgnd=%zu\n", __func__, __LINE__,
-		 queue->req_active_foreground, queue->req_active_background,
-		 fc->ring.max_foreground, fc->ring.max_background);
-
+	pr_info("%s:%d qid=%d\n", __func__, __LINE__, queue->qid);
 
 	smp_mb__before_atomic();
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
@@ -494,20 +490,13 @@ again:
 		/* XXX What happens here`
 		WARN_ON(1); */
 		spin_unlock(&queue->waitq.lock);
+		again = true;
 		goto again;
 	}
 
 	ring_req = &queue->ring_req[tag];
-	if (unlikely(ring_req->state != FRRS_WAITING)) {
-		pr_info("Invalid request state %lu.\n",
-			ring_req->state);
-		WARN_ON(1);
-		goto out;
-	}
 
-	ring_req->state = FRRS_REQ;
 	ring_req->kbuf->flags = 0;
-
 	if (for_background) {
 		ring_req->kbuf->flags |= FUSE_RING_REQ_FLAG_BACKGROUND;
 		queue->req_active_background++;
@@ -515,7 +504,6 @@ again:
 	else {
 		queue->req_active_foreground++;
 	}
-
 
 	req = &ring_req->req;
 	pr_devel("queue bit op fc=%p qid=%d tag=%d -> 0\n",
@@ -527,16 +515,17 @@ again:
 		WARN_ON(1);
 	}
 
-out:
+	ring_req->state |= FRRS_FUSE_REQ;
 	spin_unlock(&queue->waitq.lock);
 
 	if (req) {
 		memset(req, 0, sizeof(*req));
 		fuse_request_init(fm, req);
-		__set_bit(FR_URING, &req->flags);
+		set_bit(FR_URING, &req->flags);
+		clear_bit(FR_PENDING, &req->flags);
 	}
 
-	pr_devel("%s: tag=%d cnt=%llu req=%p background=%d\n",
+	pr_info("%s: tag=%d cnt=%llu req=%p background=%d\n",
 		 __func__, tag, req_cnt, req, for_background);
 
 	return req;
@@ -545,79 +534,71 @@ EXPORT_SYMBOL_GPL(fuse_request_alloc_ring);
 
 
 /*
- * @return true when the request could be released
- */
-static bool _fuse_uring_free_req(struct fuse_conn *fc,
-				 struct fuse_ring_queue *queue,
-				 struct fuse_ring_req *req)
-{
-	bool freed = false;
-	unsigned int stop_state = FRRS_WAITING | FRRS_FREEING;
-	if (0 && fc->ring.daemon->flags & PF_EXITING) {
-		/* the process is exiting, userspace is not going to complete
-		 * the request anymore
-		 */
-		stop_state |= FRRS_USERSPACE;
-	}
-
-	if (req->state & stop_state) {
-		req->state = FRRS_FREED;
-		io_uring_cmd_done(req->cmd, -EIO, 0);
-		freed = true;
-	}
-
-	return freed;
-}
-
-/*
  * This is called on shutdown
  */
-static void fuse_uring_free_req(struct fuse_conn *fc,
-				struct fuse_ring_queue *queue,
-				struct fuse_ring_req *rreq)
+static void fuse_uring_shutdown_release_req(struct fuse_conn *fc,
+					    struct fuse_ring_queue *queue,
+					    struct fuse_ring_req *rreq)
 __must_hold(&fc->ring.stop_waitq.lock)
 {
-	bool can_free = false;
+	bool may_release = false;
 
 	spin_lock(&queue->waitq.lock);
 
-	if (rreq->state == FRRS_FREED)
-		goto out; /* no work left, freed in another code path */
+	pr_devel("%s qid=%d tag=%d state=%lu\n",
+		 __func__, queue->qid, rreq->tag, rreq->state);
 
-	if (rreq->state == FRRS_USERSPACE) {
-		struct fuse_req *req = &rreq->req;
+	if (rreq->state & FRRS_FREED)
+		goto out; /* no work left, freed before */
 
-		/* ensure there is an error set, to avoid using invalid data */
-		if (req->out.h.error == 0)
-			req->out.h.error = -EINTR;
-
-		/* Not always done yet on shutdown */
-		__clear_bit(FR_PENDING, &req->flags);
-		__clear_bit(FR_SENT, &req->flags);
-		__set_bit(FR_URING, &req->flags);
-
-		rreq->state = FRRS_FREEING;
-		spin_unlock(&queue->waitq.lock);
-		fuse_request_end(req);
-		spin_lock(&queue->waitq.lock);
-	} else
-		can_free = _fuse_uring_free_req(fc, queue, rreq);
-
-	if (can_free)
+	if ((rreq->state == FRRS_INIT) ||
+	    ((rreq->state & FRRS_INIT) && (rreq->state & FRRS_USERSPACE) &&
+	     (rreq->state & FRRS_CMD_ERR))) {
+		may_release = true;
 		rreq->state = FRRS_FREED;
+		goto out; /* all done */
+	}
+
+	if (rreq->state == FRRS_FUSE_WAIT) {
+		io_uring_cmd_done(rreq->cmd, -EINTR, 0);
+		may_release = true;
+		rreq->state = FRRS_FREED;
+	} else if ((rreq->state & FRRS_USERSPACE) &&
+		    !(rreq->state & FRRS_FUSE_FETCH_COMMIT) &&
+		    !(rreq->state & FRRS_FREEING)) {
+
+		/* XXX How do we know here, when the user space daemon is not
+		 *     using the request anymore. On testing
+		 *     fc->ring.daemon->flags & PF_EXITING we do not stop
+		 *     on ctrl-c - that signal does not set FRRS_FREEING
+		 */
+
+		pr_devel("qid=%d tag=%d state=%lu request end\n",
+			 queue->qid, rreq->tag, rreq->state);
+
+		rreq->state |= FRRS_FREEING;
+		spin_unlock(&queue->waitq.lock);
+		/* ensure there is an error code set */
+		fuse_uring_request_end(rreq, true, -EINTR);
+		spin_lock(&queue->waitq.lock);
+	} else {
+		/* somewhere in between states, another thread should currently
+		 * handle it */
+		pr_devel("%s qid=%d tag=%d state=%lu\n",
+			 __func__, queue->qid, rreq->tag, rreq->state);
+	}
 
 out:
 	spin_unlock(&queue->waitq.lock);
 
 	/* might free the queue - needs to have the queue waitq lock released */
-	if (can_free) {
+	if (may_release) {
 		int refs = --fc->ring.queue_refs;
 		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
 			 fc, queue->qid, rreq->tag, refs);
 		if (refs == 0)
 			wake_up_locked(&fc->ring.stop_waitq);
 	}
-
 }
 
 /**
@@ -629,19 +610,14 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 		container_of(req, struct fuse_ring_req, req);
 	struct fuse_ring_queue *queue = ring_req->queue;
 	struct fuse_conn *fc = queue->fc;
-	int prev_state, prev_bit_val;
+	int prev_bit_val;
 	bool backgnd = !!(ring_req->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
+	bool stop_requested = false;
 
 	spin_lock(&queue->waitq.lock);
 
-	prev_state = ring_req->state;
-	if (ring_req->state != FRRS_USERSPACE &&
-	    ring_req->state != FRRS_FREEING) {
-		WARN(1, "Invalid req old_state: %lu\n", ring_req->state);
-		goto out;
-	}
-
-	ring_req->state = FRRS_WAITING;
+	/* unsets all previous flags - basically resets */
+	ring_req->state = FRRS_FUSE_WAIT;
 
 	pr_devel("queue bit op fc=%p qid=%d tag=%d -> 1\n",
 		 fc, queue->qid, ring_req->tag);
@@ -664,10 +640,11 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 		wake_up_locked(&queue->waitq);
 	}
 
-out:
+	stop_requested = queue->stop_requested;
 	spin_unlock(&queue->waitq.lock);
 
-	if (unlikely(fc->ring.stop_requested))
+	/* speeds up shutdown */
+	if (unlikely(stop_requested))
 		schedule_delayed_work(&fc->ring.stop_monitor, 0);
 
 }
@@ -684,9 +661,9 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct fuse_dev *fud = fuse_get_dev(cmd->file);
 	struct fuse_conn *fc = fud->fc;
 	struct fuse_ring_queue *queue;
-	struct fuse_ring_req *ring_req;
+	struct fuse_ring_req *ring_req = NULL;
 	u32 cmd_op = cmd->cmd_op;
-	int ret = -EIO;
+	int ret = -EIO, state;
 
 	if (!(issue_flags & IO_URING_F_SQE128)) {
 		pr_info("qid=%d tag=%d SQE128 not set\n",
@@ -718,69 +695,79 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	}
 	ring_req = &queue->ring_req[cmd_req->tag];
 
-	pr_devel("%s:%d received: cmd op %d queue %d (%p) tag %d  (%p)\n",
+	pr_devel("%s:%d received: cmd op %d qid %d (%p) tag %d  (%p)\n",
 		 __func__, __LINE__,
 		 cmd_op, cmd_req->q_id, queue, cmd_req->tag, ring_req);
 
+	spin_lock(&queue->waitq.lock);
+	if (unlikely(queue->stop_requested)) {
+		/* XXX how to ensure queue still exists? Add
+		 * an rw fc->ring.stop lock? And take that at the beginning
+		 * of this function? Better would be to advise uring
+		 * not to call this function at all? Or free the queue memory
+		 * only, on daemon PF_EXITING?
+		 */
+		ring_req = NULL;
+		ret = -EINTR;
+		spin_unlock(&queue->waitq.lock);
+		goto out;
+	}
+
+	ring_req->state |= FRRS_FUSE_FETCH_COMMIT;
+	state = ring_req->state;
+	spin_unlock(&queue->waitq.lock);
+
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
-		if (READ_ONCE(ring_req->state) != FRRS_INIT) {
-			pr_devel("%s: q_id: %d tag: %d invalid req state: %lu\n",
-				 __func__, cmd_req->q_id, cmd_req->tag,
-				 ring_req->state);
-			goto out;
-		}
+		/* XXX Test inject error */
 
 		WRITE_ONCE(ring_req->cmd, cmd);
 
-		ret = fuse_dev_uring_fetch_queued(fc, queue, ring_req);
-		if (ret >= 0) {
-			pr_devel("%s tag=%d req=%p list-req=%p bgnd=%d\n",
-				 __func__, ring_req->tag,
-				 &ring_req->req, ring_req->req_ptr,
-				 test_bit(FR_BACKGROUND, &ring_req->req.flags));
+		ret = fuse_dev_uring_fetch_send_queued(fc, queue, ring_req);
+		if (ret < 0) {
+			pr_info("q_id: %d tag: %d queue fetch err: %d\n",
+				 cmd_req->q_id, cmd_req->tag,
+				 ret);
+			goto out;
+		}
 
-			/* command registration or list req fetch - assing
-			 * credits to make subtraction logic to work
+		pr_devel("%s tag=%d req=%p list-req=%p bgnd=%d\n",
+			 __func__, ring_req->tag,
+			 &ring_req->req, ring_req->req_ptr,
+			 test_bit(FR_BACKGROUND, &ring_req->req.flags));
+		BUG_ON(ret > 1);
+
+		/* assign credits, as if the req already did work */
+		spin_lock(&queue->waitq.lock);
+		if (test_bit(FR_BACKGROUND, &ring_req->req.flags))
+			queue->req_active_background++;
+		else {
+			queue->req_active_foreground++;
+			pr_devel("%s:%d ac-foregnd=%d\n", __func__, __LINE__,
+				 queue->req_active_foreground);
+		}
+		spin_unlock(&queue->waitq.lock);
+
+		if (ret == 0) {
+			/* just a queue entry registration, without a
+			 *  fuse req - make it available
 			 */
-			spin_lock(&queue->waitq.lock);
-			if (test_bit(FR_BACKGROUND, &ring_req->req.flags))
-				queue->req_active_background++;
-			else {
-				queue->req_active_foreground++;
-				pr_devel("%s:%d ac-foregnd=%d\n", __func__, __LINE__,
-					 queue->req_active_foreground);
-			}
-			spin_unlock(&queue->waitq.lock);
-
-			if (ret == 0) {
-				/* just a queue entry registration, without a
-				 *  fuse req - make it available
-				 */
-				WRITE_ONCE(ring_req->state,
-					   FRRS_USERSPACE);
-				fuse_dev_uring_req_release(&ring_req->req);
-			}
+			fuse_dev_uring_req_release(&ring_req->req);
 		}
 
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
-		if (READ_ONCE(ring_req->state) != FRRS_USERSPACE) {
-			pr_devel("Invalid request state %lu, expected %d \n",
+		if (!(state & FRRS_USERSPACE)) {
+			pr_info("qid=%d tag=%d Invalid request state %lu, "
+				"expected %d \n", queue->qid, ring_req->tag,
 				ring_req->state, FRRS_USERSPACE);
-
-			/* check if shutdown is in process and the request
-			 * gets already handled
-			 */
-			if (fc->ring.stop_requested)
-				ret = 0;
-
 			goto out;
 		}
+
+		/* XXX Test inject error */
+
 		ring_req->cmd = cmd;
-
-		fuse_dev_uring_read_from_ring(fud, ring_req);
-
+		fuse_dev_uring_commit_and_release(fud, ring_req);
 		ret = 0;
 
 		break;
@@ -790,31 +777,18 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		goto out;
 	}
 
-	pr_devel("%s:%d ret=%d", __func__, __LINE__, ret);
-
 out:
-	if (ret < 0) {
+	pr_devel("uring cmd op=%d, qid=%d tag=%d ret=%d\n",
+		 cmd_op, queue->qid, cmd_req->tag, ret);
+
+	if (ret < 0 && ring_req != NULL) {
 		spin_lock(&queue->waitq.lock);
-		ring_req->state =  FRRS_USERSPACE;
+		ring_req->state |= (FRRS_CMD_ERR | FRRS_USERSPACE);
 		spin_unlock(&queue->waitq.lock);
-	}
-	else if (ret == 0) {
-		/* nothing */
-	} else {
-		/* the request already got handled/busy with a list req */
-		BUG_ON(ret > 1);
-	}
 
-	if (ret < 0) {
 		io_uring_cmd_done(cmd, ret, 0);
-		pr_devel("%s: req error: op=%d, tag=%d ret=%d io_flags=%x\n",
-			__func__, cmd_op, cmd_req->tag, ret, issue_flags);
-	} else {
-		pr_devel("%s: %s cmd op %d queue %d tag %d result %d\n",
-			 __func__, ret == 0 ? "req ring queued" : "req sent back",
-			cmd_op, cmd_req->q_id, cmd_req->tag, ret);
-
 	}
+
 	return -EIOCBQUEUED;
 }
 EXPORT_SYMBOL(fuse_dev_uring_cmd);
@@ -870,11 +844,14 @@ static void fuse_uring_start_destruct(struct fuse_conn *fc)
 		struct fuse_ring_queue *queue =
 			fuse_uring_get_queue(fc, qid);
 
-		wake_up_all(&queue->waitq);
+		spin_lock(&queue->waitq.lock);
+		queue->stop_requested = 1;
+		wake_up_all_locked(&queue->waitq);
+		spin_unlock(&queue->waitq.lock);
 
 		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
 			struct fuse_ring_req *rreq = &queue->ring_req[tag];
-			fuse_uring_free_req(fc, queue, rreq);
+			fuse_uring_shutdown_release_req(fc, queue, rreq);
 		}
 	}
 out:
@@ -1059,6 +1036,7 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 	}
 
 	queue->configured = 1;
+	queue->stop_requested = 0;
 	fc->ring.nr_queues_initialized++;
 	if (fc->ring.nr_queues_initialized == fc->ring.nr_queues)
 		fc->ring.configured = 1;

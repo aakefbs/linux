@@ -11,8 +11,8 @@
 
 #include "fuse_i.h"
 
-int fuse_dev_uring_write_to_ring(struct fuse_ring_req *ring_req);
-void fuse_dev_uring_read_from_ring(struct fuse_dev *fud,
+int fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req);
+void fuse_dev_uring_commit_release(struct fuse_dev *fud,
 			  struct fuse_ring_req *ring_req);
 
 void fuse_uring_ring_destruct(struct fuse_conn *fc);
