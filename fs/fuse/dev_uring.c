@@ -378,6 +378,7 @@ fuse_dev_uring_queue_for_background_req(struct fuse_conn *fc)
 		cnt++;
 
 		spin_lock(&queue->waitq.lock);
+
 		if (queue->req_active_background >= fc->ring.max_background) {
 			/* no need to wait for background requests, the caller
 			 * can handle request allocation failures
@@ -419,7 +420,7 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 	unsigned int qid = 0;
 	struct fuse_ring_queue *queue;
 
-	if (for_background && fc->ring.per_core_queue) {
+	if (0 && for_background && fc->ring.per_core_queue) {
 		/* more complex handling, for coalescencing */
 		queue = fuse_dev_uring_queue_for_background_req(fc);
 		goto out;
@@ -437,10 +438,9 @@ fuse_dev_uring_queue_from_current_task(struct fuse_conn *fc, bool for_background
 	queue = fuse_uring_get_queue(fc, qid);
 	spin_lock(&queue->waitq.lock);
 
-	if (queue->req_active_foreground >= fc->ring.max_foreground) {
+	if (queue->req_active_foreground >= fc->ring.max_foreground)
 		wait_event_interruptible_exclusive_locked(queue->waitq,
 			queue->req_active_foreground < fc->ring.max_foreground);
-	}
 
 out:
 	if (unlikely((fc->ring.daemon->flags & PF_EXITING) ||
@@ -460,26 +460,20 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_req *ring_req;
 	struct fuse_req *req = NULL;
-	uint64_t req_cnt;
 	unsigned int tag = -1, old;
 	const size_t queue_depth = fc->ring.queue_depth;
 	bool again = false;
 
 again:
-	pr_info("%s:%d backgnd=%d again=%d\n",
-		__func__, __LINE__, for_background, again);
-
 	/* returned queue is locked */
 	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
 	if (!queue)
 		return NULL;
 
-	pr_info("%s:%d qid=%d\n", __func__, __LINE__, queue->qid);
-
 	smp_mb__before_atomic();
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
-		pr_info("ring: no free bit found for qid=%d backgnd=%d "
+		pr_err("ring: no free bit found for qid=%d backgnd=%d "
 			"qdepth=%zu ac-foregnd=%d ac-backgnd=%d max-foregnd=%zu "
 			"max-backgnd=%zu\n", queue->qid, for_background,
 			queue_depth,
@@ -497,11 +491,10 @@ again:
 	ring_req = &queue->ring_req[tag];
 
 	ring_req->kbuf->flags = 0;
-	if (for_background) {
+	if (0 && for_background) {
 		ring_req->kbuf->flags |= FUSE_RING_REQ_FLAG_BACKGROUND;
 		queue->req_active_background++;
-	}
-	else {
+	} else {
 		queue->req_active_foreground++;
 	}
 
@@ -524,9 +517,6 @@ again:
 		set_bit(FR_URING, &req->flags);
 		clear_bit(FR_PENDING, &req->flags);
 	}
-
-	pr_info("%s: tag=%d cnt=%llu req=%p background=%d\n",
-		 __func__, tag, req_cnt, req, for_background);
 
 	return req;
 }
@@ -633,7 +623,7 @@ void fuse_dev_uring_req_release(struct fuse_req *req)
 		WARN_ON(prev_bit_val != 0);
 	}
 
-	if (backgnd)
+	if (0 && backgnd)
 		queue->req_active_background--;
 	else {
 		queue->req_active_foreground--;
@@ -739,7 +729,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 		/* assign credits, as if the req already did work */
 		spin_lock(&queue->waitq.lock);
-		if (test_bit(FR_BACKGROUND, &ring_req->req.flags))
+		if (0 && test_bit(FR_BACKGROUND, &ring_req->req.flags))
 			queue->req_active_background++;
 		else {
 			queue->req_active_foreground++;
