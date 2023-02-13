@@ -593,11 +593,11 @@ struct fuse_ring_queue {
 
 	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
 
-	/** current number of foreground requests */
-	u16 req_active_foreground;
+	/** current value of foreground requests */
+	u16 req_fg;
 
-	/** current number of background entries */
-	u16 req_active_background;
+	/** current value of background entries */
+	u16 req_bg;
 
 	/** waiting tasks that did not get a ring slot */
 	wait_queue_head_t waitq;
@@ -605,10 +605,12 @@ struct fuse_ring_queue {
 	/* per queue memory buffer that is devided per request */
 	char *queue_req_buf;
 
+	struct list_head bg_queue;
+
 	int configured:1;
 	int stop_requested:1;
 
-	/* size depends on queue depth */
+/* size depends on queue depth */
 	struct fuse_ring_req ring_req[];
 };
 
@@ -930,10 +932,10 @@ struct fuse_conn {
 		size_t req_buf_sz;
 
 		/* max number of background requests per queue */
-		size_t max_background;
+		size_t max_bg;
 
 		/* max number of foreground requests */
-		size_t max_foreground;
+		size_t max_fg;
 
 		/* Hold ring requests */
 		struct fuse_ring_queue *queues;
@@ -989,6 +991,9 @@ struct fuse_conn {
 		 * being hold in the stop_waitq
 		 */
 		struct delayed_work stop_monitor;
+
+		/* XXX just for debugging, remove me */
+		spinlock_t release_lock;
 	} ring;
 };
 
@@ -1238,6 +1243,7 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
  * End a finished request
  */
 void fuse_request_end(struct fuse_req *req);
+
 
 /* Abort all requests */
 void fuse_abort_conn(struct fuse_conn *fc);
