@@ -61,16 +61,17 @@ static struct fuse_req *fuse_request_alloc(struct fuse_mount *fm, gfp_t flags,
 	struct fuse_conn *fc = fm->fc;
 
 	if (fc->ring.configured && !no_uring)
-		return fuse_request_alloc_ring(fm, for_background);
-	else
-		return fuse_request_alloc_mem(fm, flags);
+		return fuse_request_alloc_ring(fm, for_background, flags);
+
+	return fuse_request_alloc_mem(fm, flags);
 }
 
 
-static void fuse_request_free(struct fuse_req *req)
+void fuse_request_free(struct fuse_req *req)
 {
 	kmem_cache_free(fuse_req_cachep, req);
 }
+EXPORT_SYMBOL_GPL(fuse_request_free);
 
 static void __fuse_get_request(struct fuse_req *req)
 {
@@ -184,7 +185,7 @@ void fuse_put_request(struct fuse_req *req)
 		}
 
 		if (test_bit(FR_URING, &req->flags))
-			fuse_dev_uring_req_release(req);
+			fuse_dev_uring_req_release_ext(req);
 		else
 			fuse_request_free(req);
 	}
@@ -339,8 +340,9 @@ void fuse_request_end(struct fuse_req *req)
 			 * fc->blocked with waiters with the wake_up() call
 			 * above.
 			 */
-			if (waitqueue_active(&fc->blocked_waitq))
+			if (waitqueue_active(&fc->blocked_waitq)) {
 				wake_up(&fc->blocked_waitq);
+			}
 		}
 
 		fc->num_background--;
@@ -555,29 +557,41 @@ err:
 	return ret;
 }
 
-static void fuse_request_send_background_uring(struct fuse_conn *fc,
+static bool fuse_request_send_background_uring(struct fuse_conn *fc,
 					       struct fuse_req *req)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
-	struct fuse_ring_req *ring_req =
-		container_of(req, struct fuse_ring_req, req);
+	int err;
 
-#if 0
-	/* acquire extra reference, since request is still needed
-	   after fuse_request_end() */
-	__fuse_get_request(req);
-#endif
+	req->in.h.unique = fuse_get_unique(fiq);
 
+	/* XXX remove and lets the users of that use the per queue values -
+	 * avoid the shared spin lock...
+	 */
 	spin_lock(&fc->bg_lock);
 	fc->num_background++;
 	fc->active_background++;
 	spin_unlock(&fc->bg_lock);
 
-	req->in.h.unique = fuse_get_unique(fiq);
-	fuse_dev_uring_send_to_ring(ring_req);
+	if (!test_bit(FR_URING, &req->flags)) {
+		/* allocated request with rings - bg queues were full on
+		 * request allocation */
+		err = fuse_dev_uring_queue_bg(fc, req);
+
+	} else {
+		struct fuse_ring_req *ring_req =
+			container_of(req, struct fuse_ring_req, req);
+
+		err = fuse_dev_uring_send_to_ring(ring_req);
+	}
+
+	return err ? false : true;
 }
 
-static bool fuse_request_queue_background(struct fuse_req *req)
+/*
+ * @return true if queued
+ */
+static int fuse_request_queue_background(struct fuse_req *req)
 {
 	struct fuse_mount *fm = req->fm;
 	struct fuse_conn *fc = fm->fc;
@@ -585,10 +599,8 @@ static bool fuse_request_queue_background(struct fuse_req *req)
 
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
 
-	if (test_bit(FR_URING, &req->flags)) {
-		fuse_request_send_background_uring(fc, req);
-		return true;
-	}
+	if (test_bit(FR_URING, &req->flags) || fc->ring.configured)
+		return fuse_request_send_background_uring(fc, req);
 
 	if (!test_bit(FR_WAITING, &req->flags)) {
 		__set_bit(FR_WAITING, &req->flags);
