@@ -54,7 +54,6 @@ fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
 	bool already = false;
 	struct fuse_req *req = &ring_req->req;
 
-
 	spin_lock(&ring_req->queue->waitq.lock);
 	if (ring_req->state & FRRS_FUSE_REQ_END)
 		already = true;
@@ -462,9 +461,9 @@ out:
  *
  * negative values for error
  */
-static int fuse_dev_uring_fetch_fc(struct fuse_conn *fc,
-				   struct fuse_ring_queue *queue,
-				   struct fuse_ring_req *ring_req)
+static int fuse_dev_uring_fetch_send_fc(struct fuse_conn *fc,
+					struct fuse_ring_queue *queue,
+					struct fuse_ring_req *ring_req)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 	struct fuse_req *q_req = NULL;
@@ -490,15 +489,20 @@ static int fuse_dev_uring_fetch_fc(struct fuse_conn *fc,
 
 	spin_lock(&queue->waitq.lock);
 	ret = fuse_dev_uring_bit_clear(ring_req, bg, __func__);
-	spin_unlock(&queue->waitq.lock);
 
-	if (unlikely(ret))
-		return ret;
+	if (unlikely(ret)) {
+		/* set back to avoid wrong fuse_req_end completion on daemon
+		 * exit
+		 */
+		ring_req->state = FRRS_INIT;
+		goto err_unlock;
+	}
 
 	/* copy over and store the initial req, on completion copy back has to
 	 * be done */
 	ring_req->req = *q_req;
 	ring_req->req_ptr = q_req;
+	spin_unlock(&queue->waitq.lock);
 
 	ret = fuse_dev_uring_send_to_ring(ring_req);
 	if (ret) {
@@ -510,6 +514,10 @@ static int fuse_dev_uring_fetch_fc(struct fuse_conn *fc,
 	else
 		ret = 1; /* request handled */
 
+	return ret;
+
+err_unlock:
+	spin_unlock(&queue->waitq.lock);
 	return ret;
 }
 
@@ -886,6 +894,11 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 			"queue-depth=%zu", queue->qid, ring_req->tag,
 			queue->req_fg, queue->req_bg, fc->ring.queue_depth);
 		ret = -ERANGE;
+
+		/* avoid completion through fuse_req_end, as there is no
+		 * fuse req assigned yet
+		 */
+		ring_req->state = FRRS_INIT;
 	}
 
 	pr_devel("%s:%d qid=%d tag=%d nr-fg=%d nr-bg=%d nr_queue_init=%d\n",
@@ -905,7 +918,7 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 	 */
 	if (nr_queue_init == fc->ring.nr_queues) {
 		fc->ring.ready = 1;
-		ret = fuse_dev_uring_fetch_fc(fc, queue, ring_req);
+		ret = fuse_dev_uring_fetch_send_fc(fc, queue, ring_req);
 		if (ret < 0) {
 			pr_info("q_id: %d tag: %d queue fetch err: %d\n",
 				 queue->qid, ring_req->tag,
@@ -917,10 +930,9 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 			 __func__, ring_req->tag,
 			 &ring_req->req, ring_req->req_ptr,
 			 test_bit(FR_BACKGROUND, &ring_req->req.flags));
-		BUG_ON(ret > 1);
+		WARN_ON(ret > 1);
 	}
 
-	ret = 0;
 out:
 	return ret;
 }
