@@ -347,7 +347,6 @@ __must_hold(&queue.waitq.lock)
 	clear_bit(FR_PENDING, &req->flags);
 	ring_req->req_ptr = req;
 	ring_req->req = *req;
-	ring_req->kbuf->flags = 0;
 
 	return true;
 }
