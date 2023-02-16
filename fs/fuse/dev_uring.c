@@ -324,6 +324,33 @@ err_unlock:
 }
 EXPORT_SYMBOL_GPL(fuse_dev_uring_queue_bg);
 
+/*
+ * Take the next (first) entry from the queue list and assign it to the given
+ * request
+ */
+static bool fuse_dev_uring_bg_queue_next(struct fuse_ring_queue *queue,
+					 struct fuse_ring_req *ring_req)
+__must_hold(&queue.waitq.lock)
+{
+	struct fuse_req *req;
+	int res;
+
+	if (list_empty(&queue->bg_queue))
+		return false;
+
+	res = fuse_dev_uring_bit_clear(ring_req, 1, __func__);
+	if (unlikely(res))
+		return false;
+
+	req = list_first_entry(&queue->bg_queue, struct fuse_req, list);
+	list_del_init(&req->list);
+	clear_bit(FR_PENDING, &req->flags);
+	ring_req->req_ptr = req;
+	ring_req->req = *req;
+	ring_req->kbuf->flags = 0;
+
+	return true;
+}
 
 /*
  * Checks for errors and stores it into the request
@@ -748,30 +775,6 @@ out:
 		if (refs == 0)
 			wake_up_locked(&fc->ring.stop_waitq);
 	}
-}
-
-static bool fuse_dev_uring_bg_queue_next(struct fuse_ring_queue *queue,
-					 struct fuse_ring_req *ring_req)
-__must_hold(&queue.waitq.lock)
-{
-	struct fuse_req *req;
-	int res;
-
-	if (list_empty(&queue->bg_queue))
-		return false;
-
-	res = fuse_dev_uring_bit_clear(ring_req, 1, __func__);
-	if (unlikely(res))
-		return false;
-
-	req = list_first_entry(&queue->bg_queue, struct fuse_req, list);
-	list_del_init(&req->list);
-	clear_bit(FR_PENDING, &req->flags);
-	ring_req->req_ptr = req;
-	ring_req->req = *req;
-	ring_req->kbuf->flags = 0;
-
-	return true;
 }
 
 /*
