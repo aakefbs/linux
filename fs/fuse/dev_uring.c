@@ -202,10 +202,9 @@ __must_hold(ring_req->queue->waitq.lock)
 			str, queue->qid, tag);
 		WARN_ON(1);
 	}
-	if (bg) {
-		ring_req->kbuf->flags |= FUSE_RING_REQ_FLAG_BACKGROUND;
+	if (bg)
 		queue->req_bg++;
-	} else
+	else
 		queue->req_fg++;
 
 	pr_devel("%35s ring bit set   fc=%p is_bg=%d qid=%d tag=%d fg=%d bg=%d "
@@ -894,7 +893,9 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 
 	ret = 0;
 	if (queue->req_fg + queue->req_bg > fc->ring.queue_depth) {
-		/* should be caught be ring state before */
+		/* should be caught by ring state before and queue depth
+		 * check before */
+		WARN_ON(1);
 		pr_info("qid=%d tag=%d request counter (fg=%d bg=%d exceeds "
 			"queue-depth=%zu", queue->qid, ring_req->tag,
 			queue->req_fg, queue->req_bg, fc->ring.queue_depth);
