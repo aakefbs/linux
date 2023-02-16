@@ -49,8 +49,9 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 static void
 fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
 {
-	struct fuse_req *req = &ring_req->req;
 	bool already = false;
+	struct fuse_req *req = &ring_req->req;
+
 
 	spin_lock(&ring_req->queue->waitq.lock);
 	if (ring_req->state & FRRS_FUSE_REQ_END)
@@ -77,8 +78,6 @@ fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
 		 * attached pointer - we need to release the ring-request
 		 * on our on own */
 		fuse_dev_uring_req_release(ring_req);
-
-
 	} else
 		fuse_request_end(req);
 }
@@ -692,8 +691,8 @@ __must_hold(&fc->ring.stop_waitq.lock)
 
 	spin_lock(&queue->waitq.lock);
 
-	pr_devel("%s qid=%d tag=%d state=%llu\n",
-		 __func__, queue->qid, rreq->tag, rreq->state);
+	pr_devel("%s fc=%p qid=%d tag=%d state=%llu\n",
+		 __func__, fc, queue->qid, rreq->tag, rreq->state);
 
 	if (rreq->state & FRRS_FREED)
 		goto out; /* no work left, freed before */
@@ -720,11 +719,12 @@ __must_hold(&fc->ring.stop_waitq.lock)
 		 *     on ctrl-c - that signal does not set FRRS_FREEING
 		 */
 
-		pr_devel("qid=%d tag=%d state=%llu request end\n",
-			 queue->qid, rreq->tag, rreq->state);
+		pr_devel("fc=%p qid=%d tag=%d state=%llu request end\n",
+			 fc, queue->qid, rreq->tag, rreq->state);
 
 		rreq->state &= ~FRRS_USERSPACE;
 		rreq->state |= FRRS_FREEING;
+
 		spin_unlock(&queue->waitq.lock);
 		/* ensure there is an error code set */
 		fuse_uring_request_end(rreq, true, -EINTR);
@@ -799,12 +799,19 @@ __must_hold(&queue.waitq.lock)
 		return;
 	}
 
-	ring_req->state = FRRS_FUSE_WAIT;
+	fuse_dev_uring_bit_set(ring_req, bg, __func__);
+
+	/* Check if this is call through shutdown/release task and already and
+	 * the request is about to be released - the state must not be reset
+	 * then, as state FRRS_FUSE_WAIT would introduce a double
+	 * io_uring_cmd_done
+	 */
+	if (ring_req->state & FRRS_FREEING)
+		return;
 
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
 	ring_req->kbuf->flags = 0;
-
-	fuse_dev_uring_bit_set(ring_req, bg, __func__);
+	ring_req->state = FRRS_FUSE_WAIT;
 
 	/* XXX: Introduce wake_up_sync_locked ? */
 	if (!bg)
@@ -1047,14 +1054,14 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		vfree(queue->queue_req_buf);
 	}
 
+	cancel_delayed_work_sync(&fc->ring.stop_monitor);
+
 	kfree(fc->ring.queues);
 	fc->ring.nr_queues_ioctl_init = 0;
 	fc->ring.queues = NULL;
 	fc->ring.queue_depth = 0;
 	fc->ring.nr_queues = 0;
 
-	/* Actually should not be running anymore already, for safety */
-	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 	put_task_struct(fc->ring.daemon);
 	fc->ring.daemon = NULL;
 }
