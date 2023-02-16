@@ -868,6 +868,74 @@ void fuse_dev_uring_req_release_ext(struct fuse_req *req)
 }
 EXPORT_SYMBOL_GPL(fuse_dev_uring_req_release_ext);
 
+/*
+ * FUSE_URING_REQ_FETCH command handling
+ */
+static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
+				struct io_uring_cmd *cmd)
+{
+	struct fuse_ring_queue *queue = ring_req->queue;
+	struct fuse_conn *fc = queue->fc;
+	int ret;
+	bool is_bg = false;
+	int nr_queue_init = 0;
+
+	spin_lock(&queue->waitq.lock);
+
+	/* register requests for foreground requests first, then backgrounds */
+	if (queue->req_fg >= fc->ring.max_fg)
+		is_bg = true;
+	fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
+
+	/* daemon side registered all requests, this queue is complete */
+	if (queue->req_fg + queue->req_bg == fc->ring.queue_depth)
+		nr_queue_init =
+			atomic_inc_return(&fc->ring.nr_queues_cmd_init);
+
+	ret = 0;
+	if (queue->req_fg + queue->req_bg > fc->ring.queue_depth) {
+		/* should be caught be ring state before */
+		pr_info("qid=%d tag=%d request counter (fg=%d bg=%d exceeds "
+			"queue-depth=%zu", queue->qid, ring_req->tag,
+			queue->req_fg, queue->req_bg, fc->ring.queue_depth);
+		ret = -ERANGE;
+	}
+
+	pr_devel("%s:%d qid=%d tag=%d nr-fg=%d nr-bg=%d nr_queue_init=%d\n",
+		__func__, __LINE__,
+		queue->qid, ring_req->tag, queue->req_fg, queue->req_bg,
+		nr_queue_init);
+
+	spin_unlock(&queue->waitq.lock);
+	if (ret)
+		goto out; /* ERANGE */
+
+	WRITE_ONCE(ring_req->cmd, cmd);
+
+	/* the last reqistered request gets what is on the fc queue -
+	 * that should be FUSE_INIT only
+	 */
+	if (nr_queue_init == fc->ring.nr_queues) {
+		ret = fuse_dev_uring_fetch_fc(fc, queue, ring_req);
+		if (ret < 0) {
+			pr_info("q_id: %d tag: %d queue fetch err: %d\n",
+				 queue->qid, ring_req->tag,
+				 ret);
+			goto out;
+		}
+
+		pr_devel("%s tag=%d req=%p list-req=%p bg=%d\n",
+			 __func__, ring_req->tag,
+			 &ring_req->req, ring_req->req_ptr,
+			 test_bit(FR_BACKGROUND, &ring_req->req.flags));
+		BUG_ON(ret > 1);
+	}
+
+	ret = 0;
+out:
+	return ret;
+}
+
 /**
  * Entry function from io_uring to handle the given passthrough command
  * (op cocde IORING_OP_URING_CMD)
@@ -883,7 +951,6 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	u32 cmd_op = cmd->cmd_op;
 	int ret = -EIO;
 	u64 prev_state;
-	int nr_queue_init = 0;
 
 	if (!(issue_flags & IO_URING_F_SQE128)) {
 		pr_info("qid=%d tag=%d SQE128 not set\n",
@@ -940,8 +1007,6 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
-		bool bg = false;
-
 		if (prev_state != FRRS_INIT) {
 			pr_info_ratelimited("Invalid state on req "
 					    "register: %llu expected %d",
@@ -952,51 +1017,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 			/* XXX error injection or test with malicious daemon */
 		}
 
-		ret = 0;
-		spin_lock(&queue->waitq.lock);
-		if (queue->req_fg >= fc->ring.max_fg)
-			bg = true;
-		fuse_dev_uring_req_release_locked(ring_req, queue, bg);
-
-		if (queue->req_fg + queue->req_bg == fc->ring.queue_depth)
-			nr_queue_init =
-				atomic_inc_return(&fc->ring.nr_queues_cmd_init);
-
-		if (queue->req_fg + queue->req_bg > fc->ring.queue_depth) {
-			/* should be caught be ring state before */
-			pr_info("request counter (fg=%d bg=%d exceeds queue-"
-				"depth=%zu", queue->req_fg, queue->req_bg,
-				fc->ring.queue_depth);
-			ret = -ERANGE;
-		}
-
-		pr_devel("%s:%d qid=%d tag=%d nr-fg=%d nr-bg=%d nr_queue_init=%d\n",
-			__func__, __LINE__,
-			queue->qid, ring_req->tag, queue->req_fg, queue->req_bg,
-			nr_queue_init);
-
-		spin_unlock(&queue->waitq.lock);
-		if (ret)
-			goto out; /* ERANGE */
-
-		WRITE_ONCE(ring_req->cmd, cmd);
-
-		if (nr_queue_init == fc->ring.nr_queues) {
-			ret = fuse_dev_uring_fetch_fc(fc, queue, ring_req);
-			if (ret < 0) {
-				pr_info("q_id: %d tag: %d queue fetch err: %d\n",
-					 cmd_req->qid, cmd_req->tag,
-					 ret);
-				goto out;
-			}
-
-			pr_devel("%s tag=%d req=%p list-req=%p bg=%d\n",
-				 __func__, ring_req->tag,
-				 &ring_req->req, ring_req->req_ptr,
-				 test_bit(FR_BACKGROUND, &ring_req->req.flags));
-			BUG_ON(ret > 1);
-		}
-
+		ret = fuse_dev_uring_fetch(ring_req, cmd);
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
 		if (!(prev_state & FRRS_USERSPACE)) {
@@ -1008,10 +1029,10 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 		/* XXX Test inject error */
 
-		ring_req->cmd = cmd;
+		WRITE_ONCE(ring_req->cmd, cmd);
 		fuse_dev_uring_commit_and_release(fud, ring_req);
-		ret = 0;
 
+		ret = 0;
 		break;
 	default:
 		ret = -EINVAL;
