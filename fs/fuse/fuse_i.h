@@ -573,7 +573,7 @@ struct fuse_ring_req {
 	struct fuse_ring_queue *queue;
 
 	/* state the request is currently in */
-	unsigned long state;
+	u64 state;
 
 	struct fuse_req req;
 	struct fuse_req *req_ptr; /* when a list request is handled */
@@ -593,11 +593,11 @@ struct fuse_ring_queue {
 
 	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
 
-	/** current value of foreground requests */
-	u16 req_fg;
+	/* available number of foreground requests  */
+	int req_fg;
 
-	/** current value of background entries */
-	u16 req_bg;
+	/* available number of background requests */
+	int req_bg;
 
 	/** waiting tasks that did not get a ring slot */
 	wait_queue_head_t waitq;
@@ -952,8 +952,11 @@ struct fuse_conn {
 		/* When zero the queue can be freed on destruction */
 		int queue_refs;
 
-		/* number of initialized queues */
-		int nr_queues_initialized;
+		/* number of initialized queues with the ioctl */
+		int nr_queues_ioctl_init;
+
+		/* number of initialized queues with the uring cmd */
+		atomic_t nr_queues_cmd_init;
 
 		/* one queue per core or a single queue only ? */
 		int per_core_queue:1;
@@ -994,9 +997,6 @@ struct fuse_conn {
 		 * being hold in the stop_waitq
 		 */
 		struct delayed_work stop_monitor;
-
-		/* XXX just for debugging, remove me */
-		spinlock_t release_lock;
 	} ring;
 };
 
