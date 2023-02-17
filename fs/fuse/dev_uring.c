@@ -1180,45 +1180,45 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 {
 	size_t queue_sz, req_sz;
 
-	if (cfg->queue.nr_queues == 0) {
+	if (cfg->nr_queues == 0) {
 		pr_info("zero number of queues is invalid.\n");
 		return -EINVAL;
 	}
 
-	if (cfg->queue.nr_queues > 1 &&
-	    cfg->queue.nr_queues != num_present_cpus()) {
+	if (cfg->nr_queues > 1 &&
+	    cfg->nr_queues != num_present_cpus()) {
 		pr_info("Number of queues (%d) does not match the "
 			"number of cores (%d).\n",
-			cfg->queue.nr_queues, num_present_cpus());
+			cfg->nr_queues, num_present_cpus());
 		return -EINVAL;
 	}
 
-	if (cfg->queue.qid > cfg->queue.nr_queues) {
+	if (cfg->qid > cfg->nr_queues) {
 		pr_info("qid (%d) exceeds number of queues (%d)\n",
-			cfg->queue.qid, cfg->queue.nr_queues);
+			cfg->qid, cfg->nr_queues);
 		return -EINVAL;
 	}
 
-	if (cfg->queue.req_buf_sz < sizeof(struct fuse_uring_buf_req)) {
+	if (cfg->req_buf_sz < sizeof(struct fuse_uring_buf_req)) {
 		pr_info("Per req buffer size too small (%d), min: %ld\n",
-			cfg->queue.req_buf_sz,
+			cfg->req_buf_sz,
 			sizeof(struct fuse_uring_buf_req));
 		return -EINVAL;
 	}
 
-	if (cfg->queue.backgnd_queue_depth >= cfg->queue.queue_depth ||
-	   !cfg->queue.backgnd_queue_depth) {
-		if (!cfg->queue.backgnd_queue_depth) {
+	if (cfg->backgnd_queue_depth >= cfg->queue_depth ||
+	   !cfg->backgnd_queue_depth) {
+		if (!cfg->backgnd_queue_depth) {
 			pr_info("Invalid ring configuration, no background queue.\n");
 		} else
 			pr_info("Invalid ring configuration, "
 				"nr-background > nr-requests.\n");
 		return -EINVAL;
 	}
-	if (cfg->queue.max_backgnd_aggr > cfg->queue.backgnd_queue_depth) {
+	if (cfg->max_backgnd_aggr > cfg->backgnd_queue_depth) {
 		pr_info("Background coalescence (%d) cannot be higher than "
-			"background queue depth %d\n", cfg->queue.max_backgnd_aggr,
-			cfg->queue.backgnd_queue_depth);
+			"background queue depth %d\n", cfg->max_backgnd_aggr,
+			cfg->backgnd_queue_depth);
 		return -EINVAL;
 	}
 
@@ -1234,26 +1234,26 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 	schedule_delayed_work(&fc->ring.stop_monitor,
 			      FURING_DAEMON_MON_PERIOD);
 
-	req_sz = cfg->queue.queue_depth * sizeof(struct fuse_ring_req);
-	fc->ring.nr_queues = cfg->queue.nr_queues;
-	fc->ring.queue_depth = cfg->queue.queue_depth;
-	fc->ring.per_core_queue = cfg->queue.nr_queues > 1;
-	fc->ring.req_buf_sz = cfg->queue.req_buf_sz;
+	req_sz = cfg->queue_depth * sizeof(struct fuse_ring_req);
+	fc->ring.nr_queues = cfg->nr_queues;
+	fc->ring.queue_depth = cfg->queue_depth;
+	fc->ring.per_core_queue = cfg->nr_queues > 1;
+	fc->ring.req_buf_sz = cfg->req_buf_sz;
 	fc->ring.queue_buf_size = fc->ring.req_buf_sz * fc->ring.queue_depth;
 	spin_lock_init(&fc->ring.backgnd_qid_lock);
 
 	queue_sz = (sizeof(*fc->ring.queues) + req_sz);
-	fc->ring.queues = kcalloc(cfg->queue.nr_queues, queue_sz, GFP_KERNEL);
+	fc->ring.queues = kcalloc(cfg->nr_queues, queue_sz, GFP_KERNEL);
 	if (!fc->ring.queues)
 		return -ENOMEM;
 	fc->ring.queue_size = queue_sz;
 
-	fc->ring.max_bg = cfg->queue.backgnd_queue_depth;
-	fc->ring.max_fg = cfg->queue.queue_depth -
-				  cfg->queue.backgnd_queue_depth;
+	fc->ring.max_bg = cfg->backgnd_queue_depth;
+	fc->ring.max_fg = cfg->queue_depth -
+				  cfg->backgnd_queue_depth;
 
 	fc->ring.max_backgnd_aggr =
-		cfg->queue.max_backgnd_aggr ? cfg->queue.max_backgnd_aggr : 0;
+		cfg->max_backgnd_aggr ? cfg->max_backgnd_aggr : 0;
 
 	fc->ring.backgnd_queue_cnt = 0;
 	fc->ring.queue_refs = 0;
@@ -1347,7 +1347,7 @@ static int fuse_dev_uring_cfg(struct fuse_conn *fc, unsigned qid,
 			goto unlock;
 	}
 
-	rc = fuse_dev_uring_queue_cfg(fc, qid, cfg->queue.numa_node_id);
+	rc = fuse_dev_uring_queue_cfg(fc, qid, cfg->numa_node_id);
 
 unlock:
 	spin_unlock(&fc->ring.stop_waitq.lock);
@@ -1398,8 +1398,8 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 
 	fc = fud->fc;
 	pr_devel("%s fc=%p flags=%llx qid=%d nq=%d  qdepth=%d\n",
-		 __func__, fc, cfg->flags, cfg->queue.qid, cfg->queue.nr_queues,
-		 cfg->queue.queue_depth);
+		 __func__, fc, cfg->flags, cfg->qid, cfg->nr_queues,
+		 cfg->queue_depth);
 
 
 	if (cfg->flags & FUSE_URING_IOCTL_FLAG_QUEUE_CFG) {
@@ -1408,7 +1408,7 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 		    (cfg->flags & FUSE_URING_IOCTL_FLAG_STOP))
 			return -EINVAL;
 
-		return fuse_dev_uring_cfg(fc, cfg->queue.qid, cfg);
+		return fuse_dev_uring_cfg(fc, cfg->qid, cfg);
 	}
 
 	if (cfg->flags & FUSE_URING_IOCTL_FLAG_WAIT) {
