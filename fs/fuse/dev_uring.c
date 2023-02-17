@@ -128,7 +128,6 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
 		return -EINVAL;
 	}
 	cs.ring.len = buf_req->in_out_arg_len;
-
 	cs.req = req;
 
 	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
@@ -185,7 +184,6 @@ err:
 	fuse_uring_request_end(ring_req, true, err);
 	return err;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_uring_send_to_ring);
 
 static void fuse_dev_uring_bit_set(struct fuse_ring_req *ring_req, bool bg,
 				   const char *str)
@@ -343,7 +341,6 @@ err_unlock:
 	spin_unlock(&queue->waitq.lock);
 	return res;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_uring_queue_bg);
 
 /*
  * Checks for errors and stores it into the request
@@ -695,8 +692,6 @@ alloc:
 	spin_unlock(&queue->waitq.lock);
 	return fuse_request_alloc_mem(fm, flags);
 }
-EXPORT_SYMBOL_GPL(fuse_request_alloc_ring);
-
 
 /*
  * This is called on shutdown
@@ -861,7 +856,6 @@ void fuse_dev_uring_req_release_ext(struct fuse_req *req)
 	if (send)
 		fuse_dev_uring_send_to_ring(ring_req);
 }
-EXPORT_SYMBOL_GPL(fuse_dev_uring_req_release_ext);
 
 /*
  * FUSE_URING_REQ_FETCH command handling
@@ -1051,7 +1045,6 @@ out:
 
 	return -EIOCBQUEUED;
 }
-EXPORT_SYMBOL(fuse_dev_uring_cmd);
 
 /**
  * Finalize the ring destruction when queue ref counters are zero.
@@ -1083,7 +1076,6 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 	put_task_struct(fc->ring.daemon);
 	fc->ring.daemon = NULL;
 }
-EXPORT_SYMBOL(fuse_uring_ring_destruct);
 
 /* Abort all list queued request on the given ring queue */
 static void fuse_uring_end_requests(struct fuse_ring_queue *queue)
@@ -1435,7 +1427,8 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 }
 
 /**
- * This is mmap for userspace uring
+ * fuse uring mmap, per ring qeuue. The queue is identified by the offset
+ * parameter
  */
 int fuse_dev_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 {
@@ -1481,4 +1474,3 @@ out:
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_ring_mmap);

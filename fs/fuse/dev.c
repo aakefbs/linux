@@ -39,7 +39,6 @@ struct fuse_dev *fuse_get_dev(struct file *file)
 	 */
 	return READ_ONCE(file->private_data);
 }
-EXPORT_SYMBOL_GPL(fuse_get_dev);
 
 struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flags)
 {
@@ -49,7 +48,6 @@ struct fuse_req *fuse_request_alloc_mem(struct fuse_mount *fm, gfp_t flags)
 
 	return req;
 }
-EXPORT_SYMBOL_GPL(fuse_request_alloc_mem);
 
 /**
  *
@@ -71,7 +69,6 @@ void fuse_request_free(struct fuse_req *req)
 {
 	kmem_cache_free(fuse_req_cachep, req);
 }
-EXPORT_SYMBOL_GPL(fuse_request_free);
 
 static void __fuse_get_request(struct fuse_req *req)
 {
@@ -190,7 +187,6 @@ void fuse_put_request(struct fuse_req *req)
 			fuse_request_free(req);
 	}
 }
-EXPORT_SYMBOL_GPL(fuse_put_request);
 
 unsigned int fuse_len_args(unsigned int numargs, struct fuse_arg *args)
 {
@@ -249,14 +245,8 @@ __releases(fiq->lock)
 
 		/* this lock is not needed at all for ring req handling */
 		spin_unlock(&fiq->lock);
-
-		pr_debug("%s req=%p ring_req=%p &ring_req->req=%p",
-			 __func__, req, ring_req, &ring_req->req);
-
 		fuse_dev_uring_send_to_ring(ring_req);
 	} else {
-
-		pr_debug("List queuing request\n");
 		list_add_tail(&req->list, &fiq->pending);
 		fiq->ops->wake_pending_and_unlock(fiq);
 	}
@@ -722,7 +712,6 @@ void fuse_copy_init(struct fuse_copy_state *cs, int write,
 	cs->write = write;
 	cs->iter = iter;
 }
-EXPORT_SYMBOL_GPL(fuse_copy_init);
 
 /* Unmap and put previous page of userspace buffer */
 void fuse_copy_finish(struct fuse_copy_state *cs)
@@ -743,7 +732,6 @@ void fuse_copy_finish(struct fuse_copy_state *cs)
 	}
 	cs->pg = NULL;
 }
-EXPORT_SYMBOL_GPL(fuse_copy_finish);
 
 /*
  * Get another pagefull of userspace buffer, and map it to kernel
@@ -803,8 +791,6 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 	} else {
 		size_t off;
 		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
-		pr_debug("%s:%d user-backend-iter=%d err=%d",
-			 __func__, __LINE__, user_backed_iter(cs->iter), err);
 		if (err < 0)
 			return err;
 		BUG_ON(!err);
@@ -834,12 +820,6 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 			pgaddr = kmap_local_page(cs->pg);
 			buf = pgaddr + cs->offset;
 		}
-
-#if 0
-		pr_debug("%s:%d write=%d ring_buf=%p arg-buf=%p off=%d ncpy: %u\n",
-			 __func__, __LINE__, cs->write, buf, *val, cs->ring.offset,
-			 ncpy);
-#endif
 
 		if (cs->write)
 			memcpy(buf, *val, ncpy);
@@ -1091,8 +1071,6 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 	while (size) {
 		if (!cs->len) {
 			int err = fuse_copy_fill(cs);
-			pr_debug("%s:%d fill err=%d",
-				 __func__, __LINE__, err);
 			if (err)
 				return err;
 		}
@@ -1111,17 +1089,13 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
 
 	for (i = 0; !err && i < numargs; i++)  {
 		struct fuse_arg *arg = &args[i];
-		if (i == numargs - 1 && argpages) {
-			pr_debug("%s:%d Here\n", __func__, __LINE__);
+		if (i == numargs - 1 && argpages)
 			err = fuse_copy_pages(cs, arg->size, zeroing);
-			pr_debug("%s:%d Here\n",  __func__, __LINE__);
-		}
 		else
 			err = fuse_copy_one(cs, arg->value, arg->size);
 	}
 	return err;
 }
-EXPORT_SYMBOL_GPL(fuse_copy_args);
 
 static int forget_pending(struct fuse_iqueue *fiq)
 {
@@ -1915,7 +1889,6 @@ static struct fuse_req *request_find(struct fuse_pqueue *fpq, u64 unique)
 	return NULL;
 }
 
-// XXX: Rename to fuse_
 int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		  unsigned nbytes)
 {
@@ -1926,15 +1899,10 @@ int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 	if (!cs->is_uring)
 		reqsize = sizeof(struct fuse_out_header);
 
-	pr_devel("%s:%d args=%p out-num=%u\n", __func__, __LINE__,
-		 args, args->out_numargs);
-
 	reqsize += fuse_len_args(args->out_numargs, args->out_args);
 
-	if (reqsize < nbytes || (reqsize > nbytes && !args->out_argvar)) {
-		pr_debug("%s:%d Here.\n", __func__, __LINE__);
+	if (reqsize < nbytes || (reqsize > nbytes && !args->out_argvar))
 		return -EINVAL;
-	}
 	else if (reqsize > nbytes) {
 		struct fuse_arg *lastarg = &args->out_args[args->out_numargs-1];
 		unsigned diffsize = reqsize - nbytes;
@@ -1943,15 +1911,11 @@ int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		if (diffsize > lastarg->size)
 			return -EINVAL;
 		lastarg->size -= diffsize;
-
-		pr_debug("%s:%d reqsize=%u nbytes=%u\n", __func__, __LINE__,
-			 reqsize, nbytes);
 	}
 
 	return fuse_copy_args(cs, args->out_numargs, args->out_pages,
 			      args->out_args, args->page_zeroing);
 }
-EXPORT_SYMBOL_GPL(copy_out_args);
 
 /*
  * Write a single reply to a request.  First the header is copied from
@@ -2314,7 +2278,6 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 		wait_event(fc->ring.stop_waitq,
 			   READ_ONCE(fc->ring.queue_refs) == 0);
 	}
-
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
@@ -2381,9 +2344,6 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	int oldfd;
 	struct fuse_dev *fud = NULL;
 	struct fuse_uring_cfg ring_conf;
-
-	pr_debug("Received cmd=%u FUSE_DEV_IOC_URING=%lu\n",
-		 cmd, FUSE_DEV_IOC_URING);
 
 	switch (cmd) {
 	case FUSE_DEV_IOC_CLONE:
