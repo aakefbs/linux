@@ -257,78 +257,11 @@ __must_hold(ring_req->queue->waitq.lock)
 	return 0;
 }
 
-int fuse_dev_uring_queue_bg(struct fuse_conn *fc, struct fuse_req *req)
-{
-	struct fuse_ring_queue *queue;
-	int qid = 0;
-	struct fuse_ring_req *ring_req = NULL;
-	const size_t queue_depth = fc->ring.queue_depth;
-	int res;
-
-	clear_bit(FR_PENDING, &req->flags);
-
-	pr_devel("%s req=%p bg=%d\n",
-		__func__, req, test_bit(FR_BACKGROUND, &req->flags));
-
-	if (fc->ring.per_core_queue) {
-		qid = task_cpu(current);
-		if (unlikely(qid) >= fc->ring.nr_queues) {
-			WARN_ONCE(1, "Core number (%u) exceeds nr of ring "
-				  "queues (%zu)\n", qid, fc->ring.nr_queues);
-			qid = 0;
-		}
-	}
-
-	queue = fuse_uring_get_queue(fc, qid);
-	spin_lock(&queue->waitq.lock);
-	if (queue->req_bg) {
-
-		/* the request was allocated from memory, but in the mean time
-		 * the queue has an empty slot  */
-		int tag = find_first_bit(queue->req_avail_map, queue_depth);
-
-		if (unlikely(tag == queue_depth)) {
-			pr_err("queue bg: no free bit found for qid=%d "
-				"qdepth=%zu av-fg=%d av-bg=%d max-fg=%zu "
-				"max-bg=%zu\n", queue->qid,
-				queue_depth, queue->req_fg, queue->req_bg,
-				fc->ring.max_fg, fc->ring.max_bg);
-
-			WARN_ON(1);
-			res = -ENOENT;
-			goto err_unlock;
-		}
-
-		res = fuse_dev_uring_bit_clear(ring_req, true, __func__);
-		if (unlikely(res))
-			goto err_unlock;
-
-
-		ring_req = &queue->ring_req[tag];
-		ring_req->kbuf->flags = 0;
-		ring_req->req_ptr = req;
-		ring_req->req = *req;
-
-	} else
-		list_add_tail(&req->list, &queue->bg_queue);
-	spin_unlock(&queue->waitq.lock);
-
-	if (ring_req != NULL)
-		fuse_dev_uring_send_to_ring(ring_req);
-
-	return 0;
-
-err_unlock:
-	spin_unlock(&queue->waitq.lock);
-	return res;
-}
-EXPORT_SYMBOL_GPL(fuse_dev_uring_queue_bg);
-
 /*
  * Take the next (first) entry from the queue list and assign it to the given
  * request
  */
-static bool fuse_dev_uring_bg_queue_next(struct fuse_ring_queue *queue,
+static bool fuse_dev_uring_get_bg_entry(struct fuse_ring_queue *queue,
 					 struct fuse_ring_req *ring_req)
 __must_hold(&queue.waitq.lock)
 {
@@ -350,6 +283,67 @@ __must_hold(&queue.waitq.lock)
 
 	return true;
 }
+
+int fuse_dev_uring_queue_bg(struct fuse_conn *fc, struct fuse_req *req)
+{
+	struct fuse_ring_queue *queue;
+	int qid = 0;
+	struct fuse_ring_req *ring_req = NULL;
+	const size_t queue_depth = fc->ring.queue_depth;
+	int res;
+
+	pr_devel("%s req=%p bg=%d\n",
+		__func__, req, test_bit(FR_BACKGROUND, &req->flags));
+
+	if (fc->ring.per_core_queue) {
+		qid = task_cpu(current);
+		if (unlikely(qid) >= fc->ring.nr_queues) {
+			WARN_ONCE(1, "Core number (%u) exceeds nr of ring "
+				  "queues (%zu)\n", qid, fc->ring.nr_queues);
+			qid = 0;
+		}
+	}
+
+	queue = fuse_uring_get_queue(fc, qid);
+	spin_lock(&queue->waitq.lock);
+	list_add_tail(&req->list, &queue->bg_queue);
+	if (queue->req_bg) {
+		bool got_req;
+
+		/* the request was allocated from memory, but in the mean time
+		 * the queue has an empty slot  */
+		int tag = find_first_bit(queue->req_avail_map, queue_depth);
+
+		if (unlikely(tag == queue_depth)) {
+			pr_err("queue bg: no free bit found for qid=%d "
+				"qdepth=%zu av-fg=%d av-bg=%d max-fg=%zu "
+				"max-bg=%zu\n", queue->qid,
+				queue_depth, queue->req_fg, queue->req_bg,
+				fc->ring.max_fg, fc->ring.max_bg);
+
+			WARN_ON(1);
+			res = -ENOENT;
+			goto err_unlock;
+		}
+		ring_req = &queue->ring_req[tag];
+		got_req = fuse_dev_uring_get_bg_entry(queue, ring_req);
+		if (unlikely(!got_req)) {
+			WARN_ON(1);
+			ring_req = NULL;
+		}
+	}
+	spin_unlock(&queue->waitq.lock);
+
+	if (ring_req != NULL)
+		fuse_dev_uring_send_to_ring(ring_req);
+
+	return 0;
+
+err_unlock:
+	spin_unlock(&queue->waitq.lock);
+	return res;
+}
+EXPORT_SYMBOL_GPL(fuse_dev_uring_queue_bg);
 
 /*
  * Checks for errors and stores it into the request
@@ -836,7 +830,7 @@ static void fuse_dev_uring_req_release(struct fuse_ring_req *ring_req)
 	fuse_dev_uring_req_release_locked(ring_req, queue, backgnd);
 
 	if (backgnd)
-		send = fuse_dev_uring_bg_queue_next(queue, ring_req);
+		send = fuse_dev_uring_get_bg_entry(queue, ring_req);
 
 	spin_unlock(&queue->waitq.lock);
 
@@ -860,7 +854,7 @@ void fuse_dev_uring_req_release_ext(struct fuse_req *req)
 	fuse_dev_uring_req_release_locked(ring_req, queue, backgnd);
 
 	if (backgnd)
-		send = fuse_dev_uring_bg_queue_next(queue, ring_req);
+		send = fuse_dev_uring_get_bg_entry(queue, ring_req);
 
 	spin_unlock(&queue->waitq.lock);
 
