@@ -589,7 +589,7 @@ static int fuse_request_queue_background(struct fuse_req *req)
 
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
 
-	if (test_bit(FR_URING, &req->flags) || fc->ring.configured)
+	if (test_bit(FR_URING, &req->flags) || fc->ring.ready)
 		return fuse_request_send_background_uring(fc, req);
 
 	if (!test_bit(FR_WAITING, &req->flags)) {

@@ -635,12 +635,10 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	if (!for_background && queue->req_fg == 0)
 		goto out;
 
-	/* XXX is this needed ? */
 	if (unlikely((fc->ring.daemon->flags & PF_EXITING) ||
 		     !fiq->connected || fc->ring.stop_requested ||
 		     queue->stop_requested)) {
-		pr_info("%s qid=%d exiting\n", __func__, queue->qid);
-		goto out;
+		goto alloc;
 	}
 
 	if (for_background && queue->req_bg == 0) {
@@ -1108,6 +1106,7 @@ static void fuse_uring_start_destruct(struct fuse_conn *fc)
 
 	/* Might be set already, but not in all call paths */
 	fc->ring.stop_requested = 1;
+	fc->ring.ready = 0;
 
 	if (fc->ring.nr_queues == 0)
 		goto out;
