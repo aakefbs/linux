@@ -607,7 +607,7 @@ __acquires(queue->waitq.lock)
 	if (!for_background && !queue->req_fg) {
 		/* background is in atomic context and cannot wait */
 		wait_event_interruptible_exclusive_locked(queue->waitq,
-			READ_ONCE(queue->req_fg) > 0);
+			queue->req_fg > 0);
 	}
 
 	return queue;
@@ -1380,10 +1380,12 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 	return 0;
 }
 
-static int fuse_dev_wakeup_destruct_wait(struct fuse_conn *fc)
+static int fuse_dev_stop_wakeup(struct fuse_conn *fc)
 {
+	spin_lock(&fc->ring.stop_waitq.lock);
 	fc->ring.stop_requested = 1;
-	wake_up(&fc->ring.stop_waitq);
+	wake_up_locked(&fc->ring.stop_waitq);
+	spin_unlock(&fc->ring.stop_waitq.lock);
 
 	return 0;
 }
@@ -1419,7 +1421,7 @@ int fuse_dev_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 	}
 
 	if (cfg->flags & FUSE_URING_IOCTL_FLAG_STOP) {
-		return fuse_dev_wakeup_destruct_wait(fc);
+		return fuse_dev_stop_wakeup(fc);
 	}
 
 	/* no command flag set */
