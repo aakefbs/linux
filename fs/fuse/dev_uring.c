@@ -40,8 +40,10 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 {
 	char *ptr = (char *)fc->ring.queues;
 
-	if (unlikely(qid > fc->ring.nr_queues))
-		return NULL;
+	if (unlikely(qid > fc->ring.nr_queues)) {
+		WARN_ON(1);
+		qid = 0;
+	}
 
 	return (struct fuse_ring_queue *)(ptr + qid * fc->ring.queue_size);
 }
@@ -627,9 +629,6 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	/* returned queue is locked */
 	queue = fuse_dev_uring_queue_from_current_task(fc, for_background);
 
-	if (!queue)
-		return NULL;
-
 	/* the waitq got woken up for some reason, although no request is
 	 * availble - typically happens on daemon termination signal
 	 */
@@ -639,7 +638,8 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 	/* XXX is this needed ? */
 	if (unlikely((fc->ring.daemon->flags & PF_EXITING) ||
 		     !fiq->connected || fc->ring.stop_requested ||
-		     (current->flags & PF_EXITING)) || queue->stop_requested) {
+		     queue->stop_requested)) {
+		pr_info("%s qid=%d exiting\n", __func__, queue->qid);
 		goto out;
 	}
 
@@ -657,7 +657,7 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
-		pr_err("ring: no free bit found for qid=%d backgnd=%d "
+		pr_info("ring: no free bit found for qid=%d backgnd=%d "
 			"qdepth=%zu av-foregnd=%d av-backgnd=%d max-foregnd=%zu "
 			"max-backgnd=%zu\n", queue->qid, for_background,
 			queue_depth, queue->req_fg, queue->req_bg,
@@ -686,7 +686,6 @@ out:
 			 __func__, queue->qid, ring_req->tag, for_background,
 			 queue->req_fg, queue->req_bg);
 	}
-
 	return req;
 
 alloc:
