@@ -172,7 +172,7 @@ int fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req)
 	/* ring req go directly into the shared memory buffer */
 	buf_req->in = req->in.h;
 
-	pr_devel("%40s qid=%d tag=%d state=%llu cmd-done op=%d unique=%llu\n",
+	pr_devel("%s qid=%d tag=%d state=%llu cmd-done op=%d unique=%llu\n",
 		__func__, ring_req->queue->qid, ring_req->tag, ring_req->state,
 		buf_req->in.opcode, buf_req->in.unique);
 
@@ -202,8 +202,10 @@ __must_hold(ring_req->queue->waitq.lock)
 	}
 	if (bg)
 		queue->req_bg++;
-	else
+	else {
 		queue->req_fg++;
+		wake_up_locked(&queue->waitq);
+	}
 
 	pr_devel("%35s ring bit set   fc=%p is_bg=%d qid=%d tag=%d fg=%d bg=%d "
 		 "bgq: %d\n",
@@ -605,7 +607,7 @@ __acquires(queue->waitq.lock)
 	if (!for_background && !queue->req_fg) {
 		/* background is in atomic context and cannot wait */
 		wait_event_interruptible_exclusive_locked(queue->waitq,
-			queue->req_fg);
+			READ_ONCE(queue->req_fg) > 0);
 	}
 
 	return queue;
@@ -803,10 +805,6 @@ __must_hold(&queue.waitq.lock)
 	ring_req->kbuf->flags = 0;
 	ring_req->state = FRRS_FUSE_WAIT;
 
-	/* XXX: Introduce wake_up_sync_locked ? */
-	if (!bg)
-		wake_up_locked(&queue->waitq);
-
 	/* speeds up shutdown */
 	if (unlikely(queue->stop_requested))
 		schedule_delayed_work(&fc->ring.stop_monitor, 0);
@@ -903,10 +901,12 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 
 	WRITE_ONCE(ring_req->cmd, cmd);
 
-	/* the last reqistered request gets what is on the fc queue -
-	 * that should be FUSE_INIT only
+	/* the last reqistered request gets what is in the
+	 * ring queue.
+	 * XXX re-enter until the queue is empty
 	 */
 	if (nr_queue_init == fc->ring.nr_queues) {
+		fc->ring.ready = 1;
 		ret = fuse_dev_uring_fetch_fc(fc, queue, ring_req);
 		if (ret < 0) {
 			pr_info("q_id: %d tag: %d queue fetch err: %d\n",

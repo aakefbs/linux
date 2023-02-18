@@ -964,8 +964,11 @@ struct fuse_conn {
 		/* userspace sent a stop ioctl */
 		int stop_requested:1;
 
-		/* Is the ring completely configured */
+		/* Is the ring completely iocl configured */
 		int configured:1;
+
+		/* Is the ring read to take requests */
+		int ready:1;
 
 		/* lock for background request handling */
 		spinlock_t backgnd_qid_lock;
