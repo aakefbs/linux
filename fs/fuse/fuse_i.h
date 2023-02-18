@@ -988,9 +988,10 @@ struct fuse_conn {
 		/* userspace process */
 		struct task_struct *daemon;
 
+		struct mutex start_stop_lock;
+
 		/* userspace has a special thread that exists only to wait
 		 * in the kernel for process stop, to release uring
-		 * The waitq lock is also used for ring setup and destruct
 		 */
 		wait_queue_head_t stop_waitq;
 

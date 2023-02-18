@@ -697,7 +697,7 @@ alloc:
 static void fuse_uring_shutdown_release_req(struct fuse_conn *fc,
 					    struct fuse_ring_queue *queue,
 					    struct fuse_ring_req *rreq)
-__must_hold(&fc->ring.stop_waitq.lock)
+__must_hold(&fc->ring.start_stop_lock)
 {
 	bool may_release = false;
 
@@ -759,7 +759,7 @@ out:
 		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
 			 fc, queue->qid, rreq->tag, refs);
 		if (refs == 0)
-			wake_up_locked(&fc->ring.stop_waitq);
+			wake_up(&fc->ring.stop_waitq);
 	}
 }
 
@@ -1101,6 +1101,7 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		struct fuse_ring_queue *queue = fuse_uring_get_queue(fc, qid);
 		vfree(queue->queue_req_buf);
 	}
+	pr_info("fc=%p freed queue buffers\n", fc);
 
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
@@ -1111,6 +1112,7 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 	fc->ring.nr_queues = 0;
 
 	put_task_struct(fc->ring.daemon);
+	mutex_init(&fc->ring.start_stop_lock);
 	fc->ring.daemon = NULL;
 }
 
@@ -1143,7 +1145,7 @@ static void fuse_uring_start_destruct(struct fuse_conn *fc)
 {
 	int qid, tag;
 
-	spin_lock(&fc->ring.stop_waitq.lock);
+	mutex_lock(&fc->ring.start_stop_lock);
 
 	/* Might be set already, but not in all call paths */
 	fc->ring.stop_requested = 1;
@@ -1156,10 +1158,12 @@ static void fuse_uring_start_destruct(struct fuse_conn *fc)
 		struct fuse_ring_queue *queue =
 			fuse_uring_get_queue(fc, qid);
 
+		if (!queue->configured)
+			continue;
+
 		fuse_uring_end_requests(queue);
 
 		spin_lock(&queue->waitq.lock);
-
 		queue->stop_requested = 1;
 		wake_up_all_locked(&queue->waitq);
 		spin_unlock(&queue->waitq.lock);
@@ -1170,7 +1174,7 @@ static void fuse_uring_start_destruct(struct fuse_conn *fc)
 		}
 	}
 out:
-	spin_unlock(&fc->ring.stop_waitq.lock);
+	mutex_unlock(&fc->ring.start_stop_lock);
 }
 
 /*
@@ -1376,7 +1380,7 @@ static int fuse_dev_uring_cfg(struct fuse_conn *fc, unsigned qid,
 	/* The lock is taken, so that user space may configure all queues
 	 * in parallel
 	 */
-	spin_lock(&fc->ring.stop_waitq.lock);
+	mutex_lock(&fc->ring.start_stop_lock);
 
 	if (fc->ring.configured) {
 		rc = -EALREADY;
@@ -1392,7 +1396,7 @@ static int fuse_dev_uring_cfg(struct fuse_conn *fc, unsigned qid,
 	rc = fuse_dev_uring_queue_cfg(fc, qid, cfg->numa_node_id);
 
 unlock:
-	spin_unlock(&fc->ring.stop_waitq.lock);
+	mutex_unlock(&fc->ring.start_stop_lock);
 
 	return rc;
 }

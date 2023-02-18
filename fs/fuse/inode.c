@@ -859,6 +859,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->max_pages = FUSE_DEFAULT_MAX_PAGES_PER_REQ;
 	fc->max_pages_limit = FUSE_MAX_MAX_PAGES;
 	init_waitqueue_head(&fc->ring.stop_waitq);
+	mutex_init(&fc->ring.start_stop_lock);
 	fc->ring.daemon = NULL;
 
 	INIT_LIST_HEAD(&fc->mounts);
@@ -1800,6 +1801,8 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 
 	if (fc->ring.queues != NULL)
 		fuse_uring_ring_destruct(fc);
+
+	mutex_destroy(&fc->ring.start_stop_lock);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_destroy);
 
