@@ -655,7 +655,6 @@ struct fuse_req *fuse_request_alloc_ring(struct fuse_mount *fm,
 		__func__, queue->qid, for_background,
 		queue->req_fg, queue->req_bg);
 
-	smp_mb__before_atomic();
 	tag = find_first_bit(queue->req_avail_map, queue_depth);
 	if (unlikely(tag == queue_depth)) {
 		pr_err("ring: no free bit found for qid=%d backgnd=%d "
@@ -1283,7 +1282,6 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 	queue->fc = fc;
 	queue->req_fg = 0;
 	bitmap_zero(queue->req_avail_map, fc->ring.queue_depth);
-	smp_mb__before_atomic();
 	init_waitqueue_head(&queue->waitq);
 	INIT_LIST_HEAD(&queue->bg_queue);
 
