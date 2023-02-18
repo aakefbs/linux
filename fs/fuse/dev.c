@@ -2276,10 +2276,16 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	//FIXME
 	// wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 
-	if (fc->ring.queues != NULL) {
-		wait_event(fc->ring.stop_waitq,
-			   READ_ONCE(fc->ring.queue_refs) == 0);
+	/* XXX Missing wait_event_locked() */
+	spin_lock(&fc->ring.stop_waitq.lock);
+	while (fc->ring.queue_refs > 0) {
+		wait_event_interruptible_locked(fc->ring.stop_waitq,
+			fc->ring.queue_refs == 0);
+		spin_unlock(&fc->ring.stop_waitq.lock);
+		cond_resched();
+		spin_lock(&fc->ring.stop_waitq.lock);
 	}
+	spin_unlock(&fc->ring.stop_waitq.lock);
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
@@ -2374,7 +2380,6 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	case FUSE_DEV_IOC_URING:
 		res = copy_from_user(&ring_conf, (void *)arg, sizeof(ring_conf));
 		if (res == 0)
-
 			res = fuse_dev_uring_ioctl(file, &ring_conf);
 		else
 			res = -EFAULT;

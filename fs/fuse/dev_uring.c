@@ -923,6 +923,65 @@ out:
 	return ret;
 }
 
+struct fuse_ring_queue *
+fuse_dev_uring_cmd_get_queue(struct fuse_conn *fc,
+			     const struct fuse_uring_cmd_req *cmd_req,
+			     unsigned int issue_flags)
+{
+	struct fuse_ring_queue *queue;
+	int ret;
+
+	if (!(issue_flags & IO_URING_F_SQE128)) {
+		pr_info("qid=%d tag=%d SQE128 not set\n",
+			cmd_req->qid, cmd_req->tag);
+		ret =  -EINVAL;
+		goto err;
+	}
+
+	if (unlikely(fc->ring.stop_requested)) {
+		ret = -ENOTCONN;
+		goto err;
+	}
+
+	if (unlikely(!fc->ring.configured)) {
+		pr_info("command for a conection that is not ring configure\n");
+		ret = -ENODEV;
+		goto err;
+	}
+
+	if (unlikely(cmd_req->qid >= fc->ring.nr_queues)) {
+		pr_devel("qid=%u >= nr-queues=%zu\n",
+			cmd_req->qid, fc->ring.nr_queues);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	queue = fuse_uring_get_queue(fc, cmd_req->qid);
+	if (unlikely(queue == NULL)) {
+		pr_info("Got NULL queue for qid=%d\n", cmd_req->qid);
+		ret = -EIO;
+		goto err;
+	}
+
+	if (unlikely(!fc->ring.configured || !queue->configured)) {
+		pr_info("Ring or queue (qid=%u) not ready.\n", cmd_req->qid);
+		ret =-ENOTCONN;
+		goto err;
+	}
+
+	if (cmd_req->tag > fc->ring.queue_depth) {
+		pr_info("tag=%u > queue-depth=%zu\n",
+			cmd_req->tag, fc->ring.queue_depth);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	return queue;
+
+err:
+	return ERR_PTR(ret);
+}
+
 /**
  * Entry function from io_uring to handle the given passthrough command
  * (op cocde IORING_OP_URING_CMD)
@@ -936,37 +995,14 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_req *ring_req = NULL;
 	u32 cmd_op = cmd->cmd_op;
-	int ret = -EIO;
 	u64 prev_state;
+	int ret;
 
-	if (!(issue_flags & IO_URING_F_SQE128)) {
-		pr_info("qid=%d tag=%d SQE128 not set\n",
-			cmd_req->qid, cmd_req->tag);
+	queue = fuse_dev_uring_cmd_get_queue(fc, cmd_req, issue_flags);
+	ret = PTR_ERR(queue);
+	if (ret < 0)
 		goto out;
-	}
 
-	if (unlikely(cmd_req->qid >= fc->ring.nr_queues)) {
-		pr_info("qid=%u > nr-queues=%zu\n",
-			cmd_req->qid, fc->ring.nr_queues);
-		goto out;
-	}
-
-	queue = fuse_uring_get_queue(fc, cmd_req->qid);
-	if (unlikely(queue == NULL)) {
-		pr_info("Got NULL queue for qid=%d\n", cmd_req->qid);
-		goto out;
-	}
-
-	if (unlikely(!fc->ring.configured || !queue->configured)) {
-		pr_info("Ring or queue (qid=%u) not ready.\n", cmd_req->qid);
-		goto out;
-	}
-
-	if (cmd_req->tag > fc->ring.queue_depth) {
-		pr_info("tag=%u > queue-depth=%zu\n",
-			cmd_req->tag, fc->ring.queue_depth);
-		goto out;
-	}
 	ring_req = &queue->ring_req[cmd_req->tag];
 
 	pr_devel("%s:%d received: cmd op %d qid %d (%p) tag %d  (%p)\n",
@@ -1007,6 +1043,11 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		ret = fuse_dev_uring_fetch(ring_req, cmd);
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
+		if (unlikely(!fc->ring.ready)) {
+			pr_info("commit and fetch, but the ring is not ready yet");
+			goto out;
+		}
+
 		if (!(prev_state & FRRS_USERSPACE)) {
 			pr_info("qid=%d tag=%d Invalid request state %llu, "
 				"missing %d \n", queue->qid, ring_req->tag,
@@ -1064,8 +1105,8 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	kfree(fc->ring.queues);
-	fc->ring.nr_queues_ioctl_init = 0;
 	fc->ring.queues = NULL;
+	fc->ring.nr_queues_ioctl_init = 0;
 	fc->ring.queue_depth = 0;
 	fc->ring.nr_queues = 0;
 
@@ -1165,7 +1206,6 @@ static char *fuse_dev_uring_alloc_queue_buf(int size, int node)
 	}
 
 	buf = vmalloc_node_user(size, node);
-
 	return buf ? buf : ERR_PTR(-ENOMEM);
 }
 
@@ -1174,6 +1214,7 @@ static char *fuse_dev_uring_alloc_queue_buf(int size, int node)
  */
 static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 				   struct fuse_uring_cfg *cfg)
+__must_hold(fc->ring.stop_waitq.lock)
 {
 	size_t queue_sz, req_sz;
 
@@ -1260,12 +1301,14 @@ static int fuse_dev_conn_uring_cfg(struct fuse_conn *fc,
 
 static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 				    unsigned node_id)
+__must_hold(fc->ring.stop_waitq.lock)
 {
 	int tag;
 	struct fuse_ring_queue *queue;
+	char *buf;
 
-	if (qid > fc->ring.nr_queues) {
-		pr_info("fuse ring queue config: qid=%u > nr-queues=%zu\n",
+	if (qid >= fc->ring.nr_queues) {
+		pr_info("fuse ring queue config: qid=%u >= nr-queues=%zu\n",
 			qid, fc->ring.nr_queues);
 		return -EINVAL;
 	}
@@ -1283,8 +1326,8 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 	init_waitqueue_head(&queue->waitq);
 	INIT_LIST_HEAD(&queue->bg_queue);
 
-	queue->queue_req_buf =
-		fuse_dev_uring_alloc_queue_buf(fc->ring.queue_buf_size, node_id);
+	buf = fuse_dev_uring_alloc_queue_buf(fc->ring.queue_buf_size, node_id);
+	queue->queue_req_buf = buf;
 	if (IS_ERR(queue->queue_req_buf))
 	{
 		int err = PTR_ERR(queue->queue_req_buf);
@@ -1297,8 +1340,7 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 		req->queue = queue;
 		req->tag = tag;
 		req->req_ptr = NULL;
-		req->kbuf = (struct fuse_uring_buf_req *)(queue->queue_req_buf +
-				fc->ring.req_buf_sz * tag);
+		req->kbuf = (struct fuse_uring_buf_req *)buf;
 
 		pr_devel("initialize qid=%d tag=%d queue=%p req=%p",
 			 qid, tag, queue, req);
@@ -1307,13 +1349,17 @@ static int fuse_dev_uring_queue_cfg(struct fuse_conn *fc, unsigned qid,
 
 		WRITE_ONCE(req->state, FRRS_INIT);
 		fc->ring.queue_refs++;
+		buf += fc->ring.req_buf_sz;
 	}
 
 	queue->configured = 1;
 	queue->stop_requested = 0;
 	fc->ring.nr_queues_ioctl_init++;
-	if (fc->ring.nr_queues_ioctl_init == fc->ring.nr_queues)
+	if (fc->ring.nr_queues_ioctl_init == fc->ring.nr_queues) {
 		fc->ring.configured = 1;
+		pr_info("fc=%p nr-queues=%zu depth=%zu ioctl ready\n",
+			fc, fc->ring.queue_depth, fc->ring.queue_depth);
+	}
 
 	return 0;
 }
@@ -1378,10 +1424,8 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 
 static int fuse_dev_stop_wakeup(struct fuse_conn *fc)
 {
-	spin_lock(&fc->ring.stop_waitq.lock);
 	fc->ring.stop_requested = 1;
-	wake_up_locked(&fc->ring.stop_waitq);
-	spin_unlock(&fc->ring.stop_waitq.lock);
+	wake_up(&fc->ring.stop_waitq);
 
 	return 0;
 }
