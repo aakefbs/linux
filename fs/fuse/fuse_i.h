@@ -328,7 +328,6 @@ enum fuse_req_flag {
 	FR_FINISHED,
 	FR_PRIVATE,
 	FR_ASYNC,
-	FR_URING,
 };
 
 /**
@@ -575,10 +574,10 @@ struct fuse_ring_req {
 	/* state the request is currently in */
 	u64 state;
 
-	int need_cmd_done;
+	int need_cmd_done:1;
+	int need_req_end:1;
 
-	struct fuse_req req;
-	struct fuse_req *req_ptr; /* when a list request is handled */
+	struct fuse_req *fuse_req; /* when a list request is handled */
 
 	struct io_uring_cmd *cmd;
 };
@@ -601,13 +600,13 @@ struct fuse_ring_queue {
 	/* available number of background requests */
 	int req_bg;
 
-	/** waiting tasks that did not get a ring slot */
-	wait_queue_head_t waitq;
+	spinlock_t lock;
 
 	/* per queue memory buffer that is devided per request */
 	char *queue_req_buf;
 
 	struct list_head bg_queue;
+	struct list_head fg_queue;
 
 	int configured:1;
 	int stop_requested:1;
