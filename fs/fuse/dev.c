@@ -554,6 +554,9 @@ static bool fuse_request_send_background_uring(struct fuse_conn *fc,
 	int err;
 
 	req->in.h.unique = fuse_get_unique(fiq);
+	req->in.h.len = sizeof(struct fuse_in_header) +
+		fuse_len_args(req->args->in_numargs,
+			      (struct fuse_arg *) req->args->in_args);
 
 	/* XXX remove and lets the users of that use the per queue values -
 	 * avoid the shared spin lock...
