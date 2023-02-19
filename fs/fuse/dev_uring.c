@@ -163,6 +163,7 @@ int fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req)
 	} else
 		ring_req->state |= FRRS_USERSPACE;
 
+	ring_req->need_cmd_done = 0;
 	spin_unlock(&ring_req->queue->waitq.lock);
 	if (err)
 		goto err;
@@ -718,6 +719,7 @@ __must_hold(&fc->ring.start_stop_lock)
 	}
 
 	if (rreq->state == FRRS_FUSE_WAIT) {
+		rreq->need_cmd_done = 0;
 		io_uring_cmd_done(rreq->cmd, -EINTR, 0);
 		may_release = true;
 		rreq->state = FRRS_FREED;
@@ -1026,6 +1028,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	prev_state = ring_req->state;
 	ring_req->state |= FRRS_FUSE_FETCH_COMMIT;
 	ring_req->state &= ~FRRS_USERSPACE;
+	ring_req->need_cmd_done = 1;
 	spin_unlock(&queue->waitq.lock);
 
 	switch (cmd_op) {
@@ -1075,6 +1078,7 @@ out:
 	if (ret < 0 && ring_req != NULL) {
 		spin_lock(&queue->waitq.lock);
 		ring_req->state |= (FRRS_CMD_ERR | FRRS_USERSPACE);
+		ring_req->need_cmd_done = 0;
 		spin_unlock(&queue->waitq.lock);
 
 		io_uring_cmd_done(cmd, ret, 0);
@@ -1085,8 +1089,6 @@ out:
 
 /**
  * Finalize the ring destruction when queue ref counters are zero.
- *
- * Has to be called with
  */
 void fuse_uring_ring_destruct(struct fuse_conn *fc)
 {
@@ -1097,23 +1099,36 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		return;
 	}
 
+	cancel_delayed_work_sync(&fc->ring.stop_monitor);
+
+	put_task_struct(fc->ring.daemon);
+	fc->ring.daemon = NULL;
+
 	for (qid = 0; qid < fc->ring.nr_queues; qid++) {
+		int tag;
 		struct fuse_ring_queue *queue = fuse_uring_get_queue(fc, qid);
+		if (!queue->configured)
+			continue;
+
+		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
+			struct fuse_ring_req *rreq = &queue->ring_req[tag];
+			if (rreq->need_cmd_done) {
+				pr_warn("fc=%p qid=%d tag=%d cmd not done\n",
+					fc, qid, tag);
+				io_uring_cmd_done(rreq->cmd, -ENOTCONN, 0);
+				rreq->need_cmd_done = 0;
+			}
+		}
+
 		vfree(queue->queue_req_buf);
 	}
 	pr_info("fc=%p freed queue buffers\n", fc);
-
-	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	kfree(fc->ring.queues);
 	fc->ring.queues = NULL;
 	fc->ring.nr_queues_ioctl_init = 0;
 	fc->ring.queue_depth = 0;
 	fc->ring.nr_queues = 0;
-
-	put_task_struct(fc->ring.daemon);
-	mutex_init(&fc->ring.start_stop_lock);
-	fc->ring.daemon = NULL;
 }
 
 /* Abort all list queued request on the given ring queue */
@@ -1351,7 +1366,8 @@ __must_hold(fc->ring.stop_waitq.lock)
 
 		req->kbuf->flags = 0;
 
-		WRITE_ONCE(req->state, FRRS_INIT);
+		req->state = FRRS_INIT;
+		req->need_cmd_done = 0;
 		fc->ring.queue_refs++;
 		buf += fc->ring.req_buf_sz;
 	}

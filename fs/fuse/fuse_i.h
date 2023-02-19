@@ -575,6 +575,8 @@ struct fuse_ring_req {
 	/* state the request is currently in */
 	u64 state;
 
+	int need_cmd_done;
+
 	struct fuse_req req;
 	struct fuse_req *req_ptr; /* when a list request is handled */
 
