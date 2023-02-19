@@ -453,75 +453,6 @@ out:
 	return;
 }
 
-/**
- * Check if an application command was queued into the list-queue
- *
- * @return 1 if a reqesust was taken from the queue, 0 if the queue was empty
- * 	   negative values on error
- *
- * negative values for error
- */
-static int fuse_dev_uring_fetch_send_fc(struct fuse_conn *fc,
-					struct fuse_ring_queue *queue,
-					struct fuse_ring_req *ring_req)
-{
-	struct fuse_iqueue *fiq = &fc->iq;
-	struct fuse_req *q_req = NULL;
-	int ret;
-	bool bg;
-
-	spin_lock(&fiq->lock);
-	if (!list_empty(&fiq->pending)) {
-		q_req = list_entry(fiq->pending.next, struct fuse_req, list);
-		clear_bit(FR_PENDING, &q_req->flags);
-		list_del_init(&q_req->list);
-	}
-	spin_unlock(&fiq->lock);
-
-	if (!q_req)
-		return 0; /* no request to handle */
-
-	if (test_bit(FR_BACKGROUND, &q_req->flags))
-		bg = true;
-
-	pr_devel("%s: args=%p ring-args=%p req=%p list-req=%p\n",
-		 __func__, q_req->args, ring_req->req.args, &ring_req->req, q_req);
-
-	spin_lock(&queue->waitq.lock);
-	ret = fuse_dev_uring_bit_clear(ring_req, bg, __func__);
-
-	if (unlikely(ret)) {
-		/* set back to avoid wrong fuse_req_end completion on daemon
-		 * exit
-		 */
-		ring_req->state = FRRS_INIT;
-		goto err_unlock;
-	}
-
-	/* copy over and store the initial req, on completion copy back has to
-	 * be done */
-	ring_req->req = *q_req;
-	ring_req->req_ptr = q_req;
-	spin_unlock(&queue->waitq.lock);
-
-	ret = fuse_dev_uring_send_to_ring(ring_req);
-	if (ret) {
-		if (unlikely(ret > 0)) {
-			WARN(1, "Unexpected return code: %d", ret);
-			ret = -EIO;
-		}
-	}
-	else
-		ret = 1; /* request handled */
-
-	return ret;
-
-err_unlock:
-	spin_unlock(&queue->waitq.lock);
-	return ret;
-}
-
-
 /* This needs rework, a shared lock between numa nodes might be a problem.
  * I.e. cycling should be within a single numa node only */
 #if 0
@@ -912,26 +843,8 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 
 	WRITE_ONCE(ring_req->cmd, cmd);
 
-	/* the last reqistered request gets what is in the
-	 * ring queue.
-	 * XXX re-enter until the queue is empty
-	 */
-	if (nr_queue_init == fc->ring.nr_queues) {
+	if (nr_queue_init == fc->ring.nr_queues)
 		fc->ring.ready = 1;
-		ret = fuse_dev_uring_fetch_send_fc(fc, queue, ring_req);
-		if (ret < 0) {
-			pr_info("q_id: %d tag: %d queue fetch err: %d\n",
-				 queue->qid, ring_req->tag,
-				 ret);
-			goto out;
-		}
-
-		pr_devel("%s tag=%d req=%p list-req=%p bg=%d\n",
-			 __func__, ring_req->tag,
-			 &ring_req->req, ring_req->req_ptr,
-			 test_bit(FR_BACKGROUND, &ring_req->req.flags));
-		WARN_ON(ret > 1);
-	}
 
 out:
 	return ret;
