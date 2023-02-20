@@ -314,8 +314,10 @@ int fuse_dev_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 
 	spin_lock(&queue->lock);
 
-	if (unlikely(queue->stop_requested))
-		return -ENOTCONN;
+	if (unlikely(queue->stop_requested)) {
+		res = -ENOTCONN;
+		goto err_unlock;
+	}
 
 	list_add_tail(&req->list, head);
 	if (*queue_avail) {
@@ -473,7 +475,7 @@ __must_hold(&fc->ring.start_stop_lock)
 
 	spin_lock(&queue->lock);
 
-	pr_info("%s fc=%p qid=%d tag=%d state=%llu\n",
+	pr_devel("%s fc=%p qid=%d tag=%d state=%llu\n",
 		 __func__, fc, queue->qid, rreq->tag, rreq->state);
 
 	if (rreq->state & FRRS_FREED)
@@ -487,7 +489,7 @@ __must_hold(&fc->ring.start_stop_lock)
 		rreq->state |= FRRS_FREED;
 
 		if (rreq->need_cmd_done) {
-			pr_info("qid=%d tag=%d sending cmd_done\n",
+			pr_devel("qid=%d tag=%d sending cmd_done\n",
 				queue->qid, rreq->tag);
 			io_uring_cmd_done(rreq->cmd, -ENOTCONN, 0);
 			rreq->need_cmd_done = 0;
@@ -514,8 +516,10 @@ out:
 		int refs = --fc->ring.queue_refs;
 		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
 			 fc, queue->qid, rreq->tag, refs);
-		if (refs == 0)
+		if (refs == 0) {
+			fc->ring.queues_stopped = 1;
 			wake_up(&fc->ring.stop_waitq);
+		}
 	}
 }
 
@@ -557,9 +561,9 @@ __must_hold(&queue.waitq.lock)
 	ring_req->kbuf->flags = 0;
 	ring_req->state = FRRS_FUSE_WAIT;
 
-	/* speeds up shutdown */
-	if (unlikely(queue->stop_requested))
-		schedule_delayed_work(&fc->ring.stop_monitor, 0);
+	/* speeds up shutdown, introduces race? */
+	// if (unlikely(queue->stop_requested))
+	// 	schedule_delayed_work(&fc->ring.stop_monitor, 0);
 }
 
 /*
@@ -812,6 +816,7 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		return;
 	}
 
+	pr_info("fc=%p canceling stop-monitor\n", fc);
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	put_task_struct(fc->ring.daemon);
@@ -835,7 +840,6 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 
 		vfree(queue->queue_req_buf);
 	}
-	pr_info("fc=%p freed queue buffers\n", fc);
 
 	kfree(fc->ring.queues);
 	fc->ring.queues = NULL;
@@ -854,20 +858,19 @@ static void fuse_uring_end_requests(struct fuse_ring_queue *queue)
 }
 
 /*
- *  Start the ring destruction
+ *  Stop the ring queues
  */
-static void fuse_uring_start_destruct(struct fuse_conn *fc)
+static void fuse_uring_stop_queues(struct fuse_conn *fc)
+__must_hold(fc->ring.start_stop_lock)
 {
 	int qid, tag;
-
-	mutex_lock(&fc->ring.start_stop_lock);
 
 	/* Might be set already, but not in all call paths */
 	fc->ring.stop_requested = 1;
 	fc->ring.ready = 0;
 
 	if (fc->ring.nr_queues == 0)
-		goto out;
+		return;
 
 	for (qid = 0; qid < fc->ring.nr_queues; qid++) {
 		struct fuse_ring_queue *queue =
@@ -887,8 +890,6 @@ static void fuse_uring_start_destruct(struct fuse_conn *fc)
 			fuse_uring_shutdown_release_req(fc, queue, rreq);
 		}
 	}
-out:
-	mutex_unlock(&fc->ring.start_stop_lock);
 }
 
 /*
@@ -901,13 +902,23 @@ static void fuse_dev_ring_stop_mon(struct work_struct *work)
 					    ring.stop_monitor.work);
 	struct fuse_iqueue *fiq = &fc->iq;
 
+	pr_info("fc=%p running stop-mon, queues-stopped=%d\n",
+		fc, fc->ring.queues_stopped);
+
+	if (fc->ring.queues_stopped)
+		return;
+
+	mutex_lock(&fc->ring.start_stop_lock);
+
 	if (!fiq->connected || fc->ring.stop_requested ||
 	    (fc->ring.daemon->flags & PF_EXITING))
-		fuse_uring_start_destruct(fc);
+		fuse_uring_stop_queues(fc);
 
-	if (READ_ONCE(fc->ring.queue_refs) > 0)
+	if (!fc->ring.queues_stopped)
 		schedule_delayed_work(&fc->ring.stop_monitor,
 				      FURING_DAEMON_MON_PERIOD);
+
+	mutex_unlock(&fc->ring.start_stop_lock);
 }
 
 /**

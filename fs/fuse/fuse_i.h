@@ -971,6 +971,9 @@ struct fuse_conn {
 		/* Is the ring read to take requests */
 		int ready:1;
 
+		/* used on shutdown */
+		int queues_stopped:1;
+
 		/* lock for background request handling */
 		spinlock_t backgnd_qid_lock;
 

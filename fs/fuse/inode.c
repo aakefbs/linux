@@ -1784,8 +1784,6 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 {
 	struct fuse_conn *fc = fm->fc;
 
-	pr_debug("%s:%d Here\n", __func__, __LINE__);
-
 	if (fc->destroy)
 		fuse_send_destroy(fm);
 
@@ -1799,9 +1797,10 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 		mutex_unlock(&fuse_mutex);
 	}
 
-	if (fc->ring.queues != NULL)
+	if (fc->ring.daemon != NULL)
 		fuse_uring_ring_destruct(fc);
 
+	pr_info("fc=%p destroying mutex\n", fc);
 	mutex_destroy(&fc->ring.start_stop_lock);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_destroy);

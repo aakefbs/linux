@@ -2268,14 +2268,20 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	//FIXME
 	// wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 
-	mutex_lock(&fc->ring.start_stop_lock);
-	while (fc->ring.queue_refs > 0) {
-		mutex_unlock(&fc->ring.start_stop_lock);
+	/* XXX/FIXME use struct completion */
+	while (true) {
+		bool may_break = false;
 		wait_event(fc->ring.stop_waitq,
 			   READ_ONCE(fc->ring.queue_refs) == 0);
+
 		mutex_lock(&fc->ring.start_stop_lock);
+		if (fc->ring.queues_stopped)
+			may_break = true;
+		mutex_unlock(&fc->ring.start_stop_lock);
+
+		if (may_break)
+			break;
 	}
-	mutex_unlock(&fc->ring.start_stop_lock);
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
