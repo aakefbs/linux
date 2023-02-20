@@ -2252,12 +2252,16 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->lock);
 
 		fuse_dev_end_requests(&to_end);
+
+		mutex_lock(&fc->ring.start_stop_lock);
+		if (!fc->ring.queues_stopped) {
+			pr_info("%s fc=%p schedule stop mon\n", __func__, fc);
+			schedule_delayed_work(&fc->ring.stop_monitor, 0);
+		}
+		mutex_unlock(&fc->ring.start_stop_lock);
 	} else {
 		spin_unlock(&fc->lock);
 	}
-
-	if (fc->ring.queues != NULL)
-		schedule_delayed_work(&fc->ring.stop_monitor, 0);
 }
 EXPORT_SYMBOL_GPL(fuse_abort_conn);
 

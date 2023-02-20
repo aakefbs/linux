@@ -175,8 +175,11 @@ static void fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req)
 		goto err;
 
 	err = fuse_uring_copy_to_ring(fc, req, buf_req);
-	if (err)
+	if (unlikely(err)) {
+		ring_req->state &= ~FRRS_USERSPACE;
+		ring_req->need_cmd_done = 1;
 		goto err;
+	}
 
 	/* ring req go directly into the shared memory buffer */
 	buf_req->in = req->in.h;
@@ -537,6 +540,8 @@ static void fuse_dev_uring_req_release_locked(struct fuse_ring_req *ring_req,
 					      bool bg)
 __must_hold(&queue.waitq.lock)
 {
+	struct fuse_conn *fc = queue->fc;
+
 	/* unsets all previous flags - basically resets */
 	pr_devel("%s qid=%d tag=%d state=%llu bg=%d\n",
 		__func__, ring_req->queue->qid, ring_req->tag, ring_req->state,
@@ -564,9 +569,9 @@ __must_hold(&queue.waitq.lock)
 	ring_req->kbuf->flags = 0;
 	ring_req->state = FRRS_FUSE_WAIT;
 
-	/* speeds up shutdown, introduces race? */
-	// if (unlikely(queue->stop_requested))
-	// 	schedule_delayed_work(&fc->ring.stop_monitor, 0);
+	/* speeds up shutdown */
+	if (unlikely(queue->stop_requested))
+		schedule_delayed_work(&fc->ring.stop_monitor, 0);
 }
 
 /*
@@ -717,12 +722,13 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct fuse_ring_req *ring_req = NULL;
 	u32 cmd_op = cmd->cmd_op;
 	u64 prev_state;
-	int ret;
+	int ret = 0;
 
 	queue = fuse_dev_uring_cmd_get_queue(fc, cmd_req, issue_flags);
-	ret = PTR_ERR(queue);
-	if (ret < 0)
+	if (IS_ERR(queue)) {
+		ret = PTR_ERR(queue);
 		goto out;
+	}
 
 	ring_req = &queue->ring_req[cmd_req->tag];
 
@@ -818,6 +824,7 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		return;
 	}
 
+	/* XXX still runs after this is called */
 	pr_info("fc=%p canceling stop-monitor\n", fc);
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
@@ -868,11 +875,15 @@ __must_hold(fc->ring.start_stop_lock)
 	int qid, tag;
 
 	/* Might be set already, but not in all call paths */
+	pr_info("%s stop request\n", __func__);
+
+	if (fc->ring.daemon == NULL)
+		return;
+
+	pr_info("%s stop request\n", __func__);
+
 	fc->ring.stop_requested = 1;
 	fc->ring.ready = 0;
-
-	if (fc->ring.nr_queues == 0)
-		return;
 
 	for (qid = 0; qid < fc->ring.nr_queues; qid++) {
 		struct fuse_ring_queue *queue =
@@ -907,18 +918,22 @@ static void fuse_dev_ring_stop_mon(struct work_struct *work)
 	pr_info("fc=%p running stop-mon, queues-stopped=%d\n",
 		fc, fc->ring.queues_stopped);
 
-	if (fc->ring.queues_stopped)
-		return;
-
 	mutex_lock(&fc->ring.start_stop_lock);
 
 	if (!fiq->connected || fc->ring.stop_requested ||
-	    (fc->ring.daemon->flags & PF_EXITING))
+	    (fc->ring.daemon->flags & PF_EXITING)) {
+		pr_info("%s Stopping queues connected=%d stop-req=%d exit=%d\n",
+			__func__, fiq->connected, fc->ring.stop_requested,
+			(fc->ring.daemon->flags & PF_EXITING));
 		fuse_uring_stop_queues(fc);
+	}
 
-	if (!fc->ring.queues_stopped)
+	if (!fc->ring.queues_stopped) {
+		pr_info("%s fc=%p schedule stop_mon\n", __func__, fc);
 		schedule_delayed_work(&fc->ring.stop_monitor,
 				      FURING_DAEMON_MON_PERIOD);
+	} else
+		pr_info("%s fc=%p not scheduling, queues stopped\n", __func__, fc);
 
 	mutex_unlock(&fc->ring.start_stop_lock);
 }
@@ -1060,8 +1075,7 @@ __must_hold(fc->ring.stop_waitq.lock)
 
 	buf = fuse_dev_uring_alloc_queue_buf(fc->ring.queue_buf_size, node_id);
 	queue->queue_req_buf = buf;
-	if (IS_ERR(queue->queue_req_buf))
-	{
+	if (IS_ERR(queue->queue_req_buf)) {
 		int err = PTR_ERR(queue->queue_req_buf);
 		queue->queue_req_buf = NULL;
 		return err;
@@ -1138,10 +1152,14 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 
+	if (fc->ring.stop_requested)
+		return -EINTR;
+
 	/* This userspace thread can stop uring on process stop, no need
 	 * for the interval worker
 	 */
-	mod_delayed_work(system_wq, &fc->ring.stop_monitor, -1UL);
+	pr_info("%s cancel stop mon to infinity\n", __func__);
+	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	wait_event_interruptible_exclusive(fc->ring.stop_waitq,
 					   !fiq->connected ||
@@ -1151,13 +1169,20 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 	 * the interval worker again. It runs immediately for quick cleanup
 	 * in shutdown/process kill.
 	 */
-	mod_delayed_work(system_wq, &fc->ring.stop_monitor, 0);
+
+	mutex_lock(&fc->ring.start_stop_lock);
+	if (!fc->ring.queues_stopped) {
+		pr_info("%s fc=%p scheduling stop mon\n", __func__, fc);
+		mod_delayed_work(system_wq, &fc->ring.stop_monitor, 0);
+	}
+	mutex_unlock(&fc->ring.start_stop_lock);
 
 	return 0;
 }
 
 static int fuse_dev_stop_wakeup(struct fuse_conn *fc)
 {
+	pr_info("%s stop request\n", __func__);
 	fc->ring.stop_requested = 1;
 	wake_up(&fc->ring.stop_waitq);
 
