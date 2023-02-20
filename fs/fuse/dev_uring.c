@@ -32,7 +32,8 @@
 /* default monitor interval for a dying daemon */
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
 
-static void fuse_dev_uring_req_release(struct fuse_ring_req *ring_req);
+static bool fuse_dev_uring_req_release(struct fuse_ring_req *ring_req);
+static void fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req);
 
 
 static struct fuse_ring_queue *
@@ -56,6 +57,7 @@ fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
 {
 	bool already = false;
 	struct fuse_req *req = ring_req->fuse_req;
+	bool send;
 
 	spin_lock(&ring_req->queue->lock);
 	if (ring_req->state & FRRS_FUSE_REQ_END || !ring_req->need_req_end)
@@ -81,8 +83,11 @@ fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
 	ring_req->fuse_req = NULL;
 
 	spin_lock(&ring_req->queue->lock);
-	fuse_dev_uring_req_release(ring_req);
+	send = fuse_dev_uring_req_release(ring_req);
 	spin_unlock(&ring_req->queue->lock);
+
+	if (send)
+		fuse_dev_uring_send_to_ring(ring_req);
 }
 
 static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
@@ -532,8 +537,6 @@ static void fuse_dev_uring_req_release_locked(struct fuse_ring_req *ring_req,
 					      bool bg)
 __must_hold(&queue.waitq.lock)
 {
-	struct fuse_conn *fc = queue->fc;
-
 	/* unsets all previous flags - basically resets */
 	pr_devel("%s qid=%d tag=%d state=%llu bg=%d\n",
 		__func__, ring_req->queue->qid, ring_req->tag, ring_req->state,
@@ -569,7 +572,7 @@ __must_hold(&queue.waitq.lock)
 /*
  * Release a uring request, called internally of dev_uring
  */
-static void fuse_dev_uring_req_release(struct fuse_ring_req *ring_req)
+static bool fuse_dev_uring_req_release(struct fuse_ring_req *ring_req)
 __must_hold(&ring_req->queue->lock)
 {
 	struct fuse_ring_queue *queue = ring_req->queue;
@@ -580,8 +583,7 @@ __must_hold(&ring_req->queue->lock)
 	fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
 	send = fuse_dev_uring_get_list_entry(ring_req, head, is_bg);
 
-	if (send)
-		fuse_dev_uring_send_to_ring(ring_req);
+	return send;
 }
 
 /*
