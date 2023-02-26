@@ -1800,7 +1800,6 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 	if (fc->ring.daemon != NULL)
 		fuse_uring_ring_destruct(fc);
 
-	pr_info("fc=%p destroying mutex\n", fc);
 	mutex_destroy(&fc->ring.start_stop_lock);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_destroy);

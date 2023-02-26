@@ -2255,7 +2255,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 
 		mutex_lock(&fc->ring.start_stop_lock);
 		if (!fc->ring.queues_stopped) {
-			pr_info("%s fc=%p schedule stop mon\n", __func__, fc);
+			fuse_uring_end_requests(fc);
 			schedule_delayed_work(&fc->ring.stop_monitor, 0);
 		}
 		mutex_unlock(&fc->ring.start_stop_lock);

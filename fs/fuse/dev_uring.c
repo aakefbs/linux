@@ -322,7 +322,7 @@ int fuse_dev_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 
 	spin_lock(&queue->lock);
 
-	if (unlikely(queue->stop_requested)) {
+	if (unlikely(queue->aborted)) {
 		res = -ENOTCONN;
 		goto err_unlock;
 	}
@@ -492,7 +492,7 @@ __must_hold(&fc->ring.start_stop_lock)
 	state = rreq->state;
 
 	if (state == FRRS_INIT || state == FRRS_FUSE_WAIT ||
-	    (state & FRRS_USERSPACE)) {
+	    ((state & FRRS_USERSPACE) && queue->aborted)) {
 
 		rreq->state |= FRRS_FREED;
 
@@ -535,17 +535,17 @@ out:
  * Release a ring request, it is no longer needed and can handle new data
  *
  */
-static void fuse_dev_uring_req_release_locked(struct fuse_ring_req *ring_req,
+static void _fuse_dev_uring_req_release_locked(struct fuse_ring_req *ring_req,
 					      struct fuse_ring_queue *queue,
 					      bool bg)
-__must_hold(&queue.waitq.lock)
+__must_hold(&queue->lock)
 {
 	struct fuse_conn *fc = queue->fc;
 
 	/* unsets all previous flags - basically resets */
-	pr_devel("%s qid=%d tag=%d state=%llu bg=%d\n",
-		__func__, ring_req->queue->qid, ring_req->tag, ring_req->state,
-		bg);
+	pr_devel("%s fc=%p qid=%d tag=%d state=%llu bg=%d\n",
+		__func__, fc, ring_req->queue->qid, ring_req->tag,
+		ring_req->state, bg);
 
 	if (ring_req->state & FRRS_USERSPACE) {
 		pr_warn("%s qid=%d tag=%d state=%llu is_bg=%d\n",
@@ -568,10 +568,6 @@ __must_hold(&queue.waitq.lock)
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
 	ring_req->kbuf->flags = 0;
 	ring_req->state = FRRS_FUSE_WAIT;
-
-	/* speeds up shutdown */
-	if (unlikely(queue->stop_requested))
-		schedule_delayed_work(&fc->ring.stop_monitor, 0);
 }
 
 /*
@@ -585,7 +581,7 @@ __must_hold(&ring_req->queue->lock)
 	bool send = false;
 	struct list_head *head = is_bg ? &queue->bg_queue : &queue->fg_queue;
 
-	fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
+	_fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
 	send = fuse_dev_uring_get_list_entry(ring_req, head, is_bg);
 
 	return send;
@@ -608,7 +604,7 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 	/* register requests for foreground requests first, then backgrounds */
 	if (queue->req_fg >= fc->ring.max_fg)
 		is_bg = true;
-	fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
+	_fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
 
 	/* daemon side registered all requests, this queue is complete */
 	if (queue->req_fg + queue->req_bg == fc->ring.queue_depth)
@@ -689,7 +685,8 @@ fuse_dev_uring_cmd_get_queue(struct fuse_conn *fc,
 		goto err;
 	}
 
-	if (unlikely(!fc->ring.configured || !queue->configured)) {
+	if (unlikely(!fc->ring.configured || !queue->configured ||
+		     queue->aborted)) {
 		pr_info("Ring or queue (qid=%u) not ready.\n", cmd_req->qid);
 		ret =-ENOTCONN;
 		goto err;
@@ -737,7 +734,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		 cmd_op, cmd_req->qid, queue, cmd_req->tag, ring_req);
 
 	spin_lock(&queue->lock);
-	if (unlikely(queue->stop_requested)) {
+	if (unlikely(queue->aborted)) {
 		/* XXX how to ensure queue still exists? Add
 		 * an rw fc->ring.stop lock? And take that at the beginning
 		 * of this function? Better would be to advise uring
@@ -824,8 +821,7 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 		return;
 	}
 
-	/* XXX still runs after this is called */
-	pr_info("fc=%p canceling stop-monitor\n", fc);
+	pr_devel("fc=%p canceling stop-monitor\n", fc);
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	put_task_struct(fc->ring.daemon);
@@ -858,12 +854,28 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 }
 
 /* Abort all list queued request on the given ring queue */
-static void fuse_uring_end_requests(struct fuse_ring_queue *queue)
+static void fuse_uring_end_queue_requests(struct fuse_ring_queue *queue)
 {
 	spin_lock(&queue->lock);
+	queue->aborted = 1;
 	fuse_dev_end_requests(&queue->fg_queue);
 	fuse_dev_end_requests(&queue->bg_queue);
 	spin_unlock(&queue->lock);
+}
+
+void fuse_uring_end_requests(struct fuse_conn *fc)
+{
+	int qid;
+
+	for (qid = 0; qid < fc->ring.nr_queues; qid++) {
+		struct fuse_ring_queue *queue =
+			fuse_uring_get_queue(fc, qid);
+
+		if (!queue->configured)
+			continue;
+
+		fuse_uring_end_queue_requests(queue);
+	}
 }
 
 /*
@@ -874,13 +886,8 @@ __must_hold(fc->ring.start_stop_lock)
 {
 	int qid, tag;
 
-	/* Might be set already, but not in all call paths */
-	pr_info("%s stop request\n", __func__);
-
 	if (fc->ring.daemon == NULL)
 		return;
-
-	pr_info("%s stop request\n", __func__);
 
 	fc->ring.stop_requested = 1;
 	fc->ring.ready = 0;
@@ -891,12 +898,6 @@ __must_hold(fc->ring.start_stop_lock)
 
 		if (!queue->configured)
 			continue;
-
-		fuse_uring_end_requests(queue);
-
-		spin_lock(&queue->lock);
-		queue->stop_requested = 1;
-		spin_unlock(&queue->lock);
 
 		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
 			struct fuse_ring_req *rreq = &queue->ring_req[tag];
@@ -915,14 +916,14 @@ static void fuse_dev_ring_stop_mon(struct work_struct *work)
 					    ring.stop_monitor.work);
 	struct fuse_iqueue *fiq = &fc->iq;
 
-	pr_info("fc=%p running stop-mon, queues-stopped=%d\n",
+	pr_devel("fc=%p running stop-mon, queues-stopped=%d\n",
 		fc, fc->ring.queues_stopped);
 
 	mutex_lock(&fc->ring.start_stop_lock);
 
 	if (!fiq->connected || fc->ring.stop_requested ||
 	    (fc->ring.daemon->flags & PF_EXITING)) {
-		pr_info("%s Stopping queues connected=%d stop-req=%d exit=%d\n",
+		pr_devel("%s Stopping queues connected=%d stop-req=%d exit=%d\n",
 			__func__, fiq->connected, fc->ring.stop_requested,
 			(fc->ring.daemon->flags & PF_EXITING));
 		fuse_uring_stop_queues(fc);
@@ -933,7 +934,7 @@ static void fuse_dev_ring_stop_mon(struct work_struct *work)
 		schedule_delayed_work(&fc->ring.stop_monitor,
 				      FURING_DAEMON_MON_PERIOD);
 	} else
-		pr_info("%s fc=%p not scheduling, queues stopped\n", __func__, fc);
+		pr_devel("%s fc=%p not scheduling, queues stopped\n", __func__, fc);
 
 	mutex_unlock(&fc->ring.start_stop_lock);
 }
@@ -1101,7 +1102,7 @@ __must_hold(fc->ring.stop_waitq.lock)
 	}
 
 	queue->configured = 1;
-	queue->stop_requested = 0;
+	queue->aborted = 0;
 	fc->ring.nr_queues_ioctl_init++;
 	if (fc->ring.nr_queues_ioctl_init == fc->ring.nr_queues) {
 		fc->ring.configured = 1;
@@ -1158,7 +1159,6 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 	/* This userspace thread can stop uring on process stop, no need
 	 * for the interval worker
 	 */
-	pr_info("%s cancel stop mon to infinity\n", __func__);
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	wait_event_interruptible_exclusive(fc->ring.stop_waitq,
@@ -1171,10 +1171,8 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 	 */
 
 	mutex_lock(&fc->ring.start_stop_lock);
-	if (!fc->ring.queues_stopped) {
-		pr_info("%s fc=%p scheduling stop mon\n", __func__, fc);
+	if (!fc->ring.queues_stopped)
 		mod_delayed_work(system_wq, &fc->ring.stop_monitor, 0);
-	}
 	mutex_unlock(&fc->ring.start_stop_lock);
 
 	return 0;
@@ -1182,7 +1180,6 @@ static int fuse_dev_uring_wait_stop(struct fuse_conn *fc)
 
 static int fuse_dev_stop_wakeup(struct fuse_conn *fc)
 {
-	pr_info("%s stop request\n", __func__);
 	fc->ring.stop_requested = 1;
 	wake_up(&fc->ring.stop_waitq);
 

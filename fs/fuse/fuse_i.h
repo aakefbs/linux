@@ -609,7 +609,7 @@ struct fuse_ring_queue {
 	struct list_head fg_queue;
 
 	int configured:1;
-	int stop_requested:1;
+	int aborted:1;
 
 /* size depends on queue depth */
 	struct fuse_ring_req ring_req[];
