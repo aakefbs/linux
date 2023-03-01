@@ -472,66 +472,6 @@ out:
 }
 
 /*
- * This is called on shutdown
- *
- * XXX This unlocks the queue in the middle
- */
-static void fuse_uring_shutdown_release_req(struct fuse_conn *fc,
-					    struct fuse_ring_queue *queue,
-					    struct fuse_ring_ent *ent)
-__must_hold(&fc->ring.start_stop_lock)
-__must_hold(&queue->lock)
-{
-	bool may_release = false;
-	int state;
-
-	pr_devel("%s fc=%p qid=%d tag=%d state=%llu\n",
-		 __func__, fc, queue->qid, ent->tag, ent->state);
-
-	if (ent->state & FRRS_FREED)
-		goto out; /* no work left, freed before */
-
-	state = ent->state;
-
-	if (state == FRRS_INIT || state == FRRS_FUSE_WAIT ||
-	    ((state & FRRS_USERSPACE) && queue->aborted)) {
-		ent->state |= FRRS_FREED;
-
-		if (ent->need_cmd_done) {
-			pr_devel("qid=%d tag=%d sending cmd_done\n",
-				queue->qid, ent->tag);
-			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
-			ent->need_cmd_done = 0;
-		}
-
-		if (ent->need_req_end) {
-			spin_unlock(&queue->lock);
-			fuse_uring_req_end_and_get_next(ent, true, -ENOTCONN);
-			spin_lock(&queue->lock);
-		}
-		may_release = true;
-	} else {
-		/* somewhere in between states, another thread should currently
-		 * handle it */
-		pr_devel("%s qid=%d tag=%d state=%llu\n",
-			 __func__, queue->qid, ent->tag, ent->state);
-	}
-
-out:
-
-	/* might free the queue - needs to have the queue waitq lock released */
-	if (may_release) {
-		int refs = --fc->ring.queue_refs;
-		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
-			 fc, queue->qid, ent->tag, refs);
-		if (refs == 0) {
-			fc->ring.queues_stopped = 1;
-			wake_up(&fc->ring.stop_waitq);
-		}
-	}
-}
-
-/*
  * Release a ring request, it is no longer needed and can handle new data
  *
  */
@@ -644,6 +584,76 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 
 out:
 	return ret;
+}
+
+/**
+ * Simplified ring-entry release function, for shutdown only
+ */
+static void _fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent)
+__must_hold(&queue->lock)
+{
+	bool is_bg = !!(ent->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
+
+	ent->state |= FRRS_FUSE_REQ_END;
+	ent->need_req_end = 0;
+	fuse_request_end(ent->fuse_req);
+	ent->fuse_req = NULL;
+	fuse_uring_bit_set(ent, is_bg, __func__);
+}
+
+/*
+ * Release a request/entry on connection shutdown
+ */
+static void fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent)
+__must_hold(&fc->ring.start_stop_lock)
+__must_hold(&queue->lock)
+{
+	struct fuse_ring_queue *queue = ent->queue;
+	struct fuse_conn *fc = queue->fc;
+	bool may_release = false;
+	int state;
+
+	pr_devel("%s fc=%p qid=%d tag=%d state=%llu\n",
+		 __func__, fc, queue->qid, ent->tag, ent->state);
+
+	if (ent->state & FRRS_FREED)
+		goto out; /* no work left, freed before */
+
+	state = ent->state;
+
+	if (state == FRRS_INIT || state == FRRS_FUSE_WAIT ||
+	    ((state & FRRS_USERSPACE) && queue->aborted)) {
+		ent->state |= FRRS_FREED;
+
+		if (ent->need_cmd_done) {
+			pr_devel("qid=%d tag=%d sending cmd_done\n",
+				queue->qid, ent->tag);
+			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
+			ent->need_cmd_done = 0;
+		}
+
+		if (ent->need_req_end)
+			_fuse_uring_shutdown_release_ent(ent);
+		may_release = true;
+	} else {
+		/* somewhere in between states, another thread should currently
+		 * handle it */
+		pr_devel("%s qid=%d tag=%d state=%llu\n",
+			 __func__, queue->qid, ent->tag, ent->state);
+	}
+
+out:
+
+	/* might free the queue - needs to have the queue waitq lock released */
+	if (may_release) {
+		int refs = --fc->ring.queue_refs;
+		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
+			 fc, queue->qid, ent->tag, refs);
+		if (refs == 0) {
+			fc->ring.queues_stopped = 1;
+			wake_up(&fc->ring.stop_waitq);
+		}
+	}
 }
 
 struct fuse_ring_queue *
@@ -893,7 +903,7 @@ __must_hold(&queue->lock)
 
 	for (tag = 0; tag < fc->ring.queue_depth; tag++) {
 		struct fuse_ring_ent *ent = &queue->ring_ent[tag];
-		fuse_uring_shutdown_release_req(fc, queue, ent);
+		fuse_uring_shutdown_release_ent(ent);
 	}
 }
 
