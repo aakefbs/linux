@@ -231,7 +231,7 @@ __releases(fiq->lock)
 
 		/* this lock is not needed at all for ring req handling */
 		spin_unlock(&fiq->lock);
-		res = fuse_dev_uring_queue_fuse_req(fc, req);
+		res = fuse_uring_queue_fuse_req(fc, req);
 		if (!res)
 			return;
 
@@ -548,7 +548,7 @@ static bool fuse_request_queue_background_uring(struct fuse_conn *fc,
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 
-	err = fuse_dev_uring_queue_fuse_req(fc, req);
+	err = fuse_uring_queue_fuse_req(fc, req);
 	if (!err) {
 		/* XXX remove and lets the users of that use per queue values -
 		 * avoid the shared spin lock...
@@ -2380,7 +2380,7 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	case FUSE_DEV_IOC_URING:
 		res = copy_from_user(&ring_conf, (void *)arg, sizeof(ring_conf));
 		if (res == 0)
-			res = fuse_dev_uring_ioctl(file, &ring_conf);
+			res = fuse_uring_ioctl(file, &ring_conf);
 		else
 			res = -EFAULT;
 
@@ -2405,8 +2405,8 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
-	.uring_cmd 	= fuse_dev_uring_cmd,
-	.mmap		= fuse_dev_ring_mmap,
+	.uring_cmd 	= fuse_uring_cmd,
+	.mmap		= fuse_uring_mmap,
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 
