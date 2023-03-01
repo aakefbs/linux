@@ -50,7 +50,7 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 }
 
 /*
- * Finalize a ring request, then fetch and send the next entry, if available
+ * Finalize a fuse request, then fetch and send the next entry, if available
  *
  * has lock/unlock/lock to avoid holding the lock on calling fuse_request_end
  */
@@ -90,6 +90,8 @@ fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
 	send = fuse_uring_ent_release_and_fetch(ring_ent);
 	if (send)
 		fuse_uring_send_to_ring(ring_ent);
+
+	return;
 }
 
 static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
@@ -476,7 +478,7 @@ out:
  */
 static void fuse_uring_shutdown_release_req(struct fuse_conn *fc,
 					    struct fuse_ring_queue *queue,
-					    struct fuse_ring_ent *rreq)
+					    struct fuse_ring_ent *ent)
 __must_hold(&fc->ring.start_stop_lock)
 __must_hold(&queue->lock)
 {
@@ -484,28 +486,27 @@ __must_hold(&queue->lock)
 	int state;
 
 	pr_devel("%s fc=%p qid=%d tag=%d state=%llu\n",
-		 __func__, fc, queue->qid, rreq->tag, rreq->state);
+		 __func__, fc, queue->qid, ent->tag, ent->state);
 
-	if (rreq->state & FRRS_FREED)
+	if (ent->state & FRRS_FREED)
 		goto out; /* no work left, freed before */
 
-	state = rreq->state;
+	state = ent->state;
 
 	if (state == FRRS_INIT || state == FRRS_FUSE_WAIT ||
 	    ((state & FRRS_USERSPACE) && queue->aborted)) {
+		ent->state |= FRRS_FREED;
 
-		rreq->state |= FRRS_FREED;
-
-		if (rreq->need_cmd_done) {
+		if (ent->need_cmd_done) {
 			pr_devel("qid=%d tag=%d sending cmd_done\n",
-				queue->qid, rreq->tag);
-			io_uring_cmd_done(rreq->cmd, -ENOTCONN, 0);
-			rreq->need_cmd_done = 0;
+				queue->qid, ent->tag);
+			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
+			ent->need_cmd_done = 0;
 		}
 
-		if (rreq->need_req_end) {
+		if (ent->need_req_end) {
 			spin_unlock(&queue->lock);
-			fuse_uring_req_end_and_get_next(rreq, true, -ENOTCONN);
+			fuse_uring_req_end_and_get_next(ent, true, -ENOTCONN);
 			spin_lock(&queue->lock);
 		}
 		may_release = true;
@@ -513,7 +514,7 @@ __must_hold(&queue->lock)
 		/* somewhere in between states, another thread should currently
 		 * handle it */
 		pr_devel("%s qid=%d tag=%d state=%llu\n",
-			 __func__, queue->qid, rreq->tag, rreq->state);
+			 __func__, queue->qid, ent->tag, ent->state);
 	}
 
 out:
@@ -522,7 +523,7 @@ out:
 	if (may_release) {
 		int refs = --fc->ring.queue_refs;
 		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
-			 fc, queue->qid, rreq->tag, refs);
+			 fc, queue->qid, ent->tag, refs);
 		if (refs == 0) {
 			fc->ring.queues_stopped = 1;
 			wake_up(&fc->ring.stop_waitq);
@@ -834,12 +835,12 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 			continue;
 
 		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-			struct fuse_ring_ent *rreq = &queue->ring_ent[tag];
-			if (rreq->need_cmd_done) {
+			struct fuse_ring_ent *ent = &queue->ring_ent[tag];
+			if (ent->need_cmd_done) {
 				pr_warn("fc=%p qid=%d tag=%d cmd not done\n",
 					fc, qid, tag);
-				io_uring_cmd_done(rreq->cmd, -ENOTCONN, 0);
-				rreq->need_cmd_done = 0;
+				io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
+				ent->need_cmd_done = 0;
 			}
 		}
 
@@ -891,8 +892,8 @@ __must_hold(&queue->lock)
 		return;
 
 	for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-		struct fuse_ring_ent *rreq = &queue->ring_ent[tag];
-		fuse_uring_shutdown_release_req(fc, queue, rreq);
+		struct fuse_ring_ent *ent = &queue->ring_ent[tag];
+		fuse_uring_shutdown_release_req(fc, queue, ent);
 	}
 }
 
