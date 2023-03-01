@@ -562,7 +562,7 @@ enum fuse_ring_req_state {
 	FRRS_FREED = 1u << 8,
 };
 
-struct fuse_ring_req {
+struct fuse_ring_ent {
 	/* pointer to kernel request buffer, userspace side has mmaped
 	 * this */
 	struct fuse_uring_buf_req *kbuf;
@@ -612,7 +612,7 @@ struct fuse_ring_queue {
 	int aborted:1;
 
 /* size depends on queue depth */
-	struct fuse_ring_req ring_req[];
+	struct fuse_ring_ent ring_ent[];
 };
 
 /**

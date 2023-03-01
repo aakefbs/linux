@@ -32,8 +32,8 @@
 /* default monitor interval for a dying daemon */
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
 
-static bool fuse_dev_uring_req_release(struct fuse_ring_req *ring_req);
-static void fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req);
+static bool fuse_dev_uring_ent_release(struct fuse_ring_ent *ring_ent);
+static void fuse_dev_uring_send_to_ring(struct fuse_ring_ent *ring_ent);
 
 
 static struct fuse_ring_queue *
@@ -53,26 +53,26 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
  * has lock/unlock/lock to avoid holding the lock on calling fuse_request_end
  */
 static void
-fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
+fuse_uring_entuest_end(struct fuse_ring_ent *ring_ent, bool set_err, int error)
 {
 	bool already = false;
-	struct fuse_req *req = ring_req->fuse_req;
+	struct fuse_req *req = ring_ent->fuse_req;
 	bool send;
 
-	spin_lock(&ring_req->queue->lock);
-	if (ring_req->state & FRRS_FUSE_REQ_END || !ring_req->need_req_end)
+	spin_lock(&ring_ent->queue->lock);
+	if (ring_ent->state & FRRS_FUSE_REQ_END || !ring_ent->need_req_end)
 		already = true;
 	else {
-		ring_req->state |= FRRS_FUSE_REQ_END;
-		ring_req->need_req_end = 0;
+		ring_ent->state |= FRRS_FUSE_REQ_END;
+		ring_ent->need_req_end = 0;
 	}
-	spin_unlock(&ring_req->queue->lock);
+	spin_unlock(&ring_ent->queue->lock);
 
 	if (already) {
-		struct fuse_ring_queue *queue = ring_req->queue;
+		struct fuse_ring_queue *queue = ring_ent->queue;
 		if (!queue->aborted) {
 			pr_info("request end not needed state=%llu end-bit=%d \n",
-				ring_req->state, ring_req->need_req_end);
+				ring_ent->state, ring_ent->need_req_end);
 			WARN_ON(1);
 		}
 		return;
@@ -81,14 +81,14 @@ fuse_uring_request_end(struct fuse_ring_req *ring_req, bool set_err, int error)
 	if (set_err)
 		req->out.h.error = error;
 
-	pr_devel("Ending req %p\n", ring_req->fuse_req);
-	fuse_request_end(ring_req->fuse_req);
-	ring_req->fuse_req = NULL;
+	pr_devel("Ending req %p\n", ring_ent->fuse_req);
+	fuse_request_end(ring_ent->fuse_req);
+	ring_ent->fuse_req = NULL;
 
-	send = fuse_dev_uring_req_release(ring_req);
+	send = fuse_dev_uring_ent_release(ring_ent);
 
 	if (send)
-		fuse_dev_uring_send_to_ring(ring_req);
+		fuse_dev_uring_send_to_ring(ring_ent);
 }
 
 static int fuse_uring_copy_to_ring(struct fuse_conn *fc,
@@ -150,35 +150,35 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
  * userspace will read it
  * This is comparable with classical read(/dev/fuse)
  */
-static void fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req)
+static void fuse_dev_uring_send_to_ring(struct fuse_ring_ent *ring_ent)
 {
-	struct fuse_conn *fc = ring_req->queue->fc;
-	struct fuse_uring_buf_req *buf_req = ring_req->kbuf;
-	struct fuse_req *req = ring_req->fuse_req;
+	struct fuse_conn *fc = ring_ent->queue->fc;
+	struct fuse_uring_buf_req *buf_req = ring_ent->kbuf;
+	struct fuse_req *req = ring_ent->fuse_req;
 	int err = 0;
 
 	pr_devel("%s:%d ring-req=%p fuse_req=%p state=%llu args=%p \n", __func__,
-		 __LINE__, ring_req, ring_req->fuse_req, ring_req->state, req->args);
+		 __LINE__, ring_ent, ring_ent->fuse_req, ring_ent->state, req->args);
 
-	spin_lock(&ring_req->queue->lock);
-	if (unlikely((ring_req->state & FRRS_USERSPACE) ||
-		     (ring_req->state & FRRS_FREED))) {
+	spin_lock(&ring_ent->queue->lock);
+	if (unlikely((ring_ent->state & FRRS_USERSPACE) ||
+		     (ring_ent->state & FRRS_FREED))) {
 		pr_err("ring-req=%p buf_req=%p invalid state %llu on send\n",
-		       ring_req, buf_req, ring_req->state);
+		       ring_ent, buf_req, ring_ent->state);
 		WARN_ON(1);
 		err = -EIO;
 	} else
-		ring_req->state |= FRRS_USERSPACE;
+		ring_ent->state |= FRRS_USERSPACE;
 
-	ring_req->need_cmd_done = 0;
-	spin_unlock(&ring_req->queue->lock);
+	ring_ent->need_cmd_done = 0;
+	spin_unlock(&ring_ent->queue->lock);
 	if (err)
 		goto err;
 
 	err = fuse_uring_copy_to_ring(fc, req, buf_req);
 	if (unlikely(err)) {
-		ring_req->state &= ~FRRS_USERSPACE;
-		ring_req->need_cmd_done = 1;
+		ring_ent->state &= ~FRRS_USERSPACE;
+		ring_ent->need_cmd_done = 1;
 		goto err;
 	}
 
@@ -186,24 +186,24 @@ static void fuse_dev_uring_send_to_ring(struct fuse_ring_req *ring_req)
 	buf_req->in = req->in.h;
 
 	pr_devel("%s qid=%d tag=%d state=%llu cmd-done op=%d unique=%llu\n",
-		__func__, ring_req->queue->qid, ring_req->tag, ring_req->state,
+		__func__, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
 		buf_req->in.opcode, buf_req->in.unique);
 
-	io_uring_cmd_done(ring_req->cmd, 0, 0);
+	io_uring_cmd_done(ring_ent->cmd, 0, 0);
 	return;
 
 err:
-	fuse_uring_request_end(ring_req, true, err);
+	fuse_uring_entuest_end(ring_ent, true, err);
 }
 
-static void fuse_dev_uring_bit_set(struct fuse_ring_req *ring_req, bool bg,
+static void fuse_dev_uring_bit_set(struct fuse_ring_ent *ring_ent, bool bg,
 				   const char *str)
-__must_hold(ring_req->queue->lock)
+__must_hold(ring_ent->queue->lock)
 {
 	int old;
-	struct fuse_ring_queue *queue = ring_req->queue;
+	struct fuse_ring_queue *queue = ring_ent->queue;
 	const struct fuse_conn *fc = queue->fc;
-	int tag = ring_req->tag;
+	int tag = ring_ent->tag;
 
 	old = test_and_set_bit(tag, queue->req_avail_map);
 	if (unlikely(old != 0)) {
@@ -219,24 +219,24 @@ __must_hold(ring_req->queue->lock)
 
 	pr_devel("%35s ring bit set   fc=%p is_bg=%d qid=%d tag=%d fg=%d bg=%d "
 		 "bgq: %d\n",
-		 str, fc, bg, queue->qid, ring_req->tag, queue->req_fg,
+		 str, fc, bg, queue->qid, ring_ent->tag, queue->req_fg,
 		 queue->req_bg, !list_empty(&queue->bg_queue));
 }
 
-static int fuse_dev_uring_bit_clear(struct fuse_ring_req *ring_req, int is_bg,
+static int fuse_dev_uring_bit_clear(struct fuse_ring_ent *ring_ent, int is_bg,
 				     const char *str)
-__must_hold(ring_req->queue->lock)
+__must_hold(ring_ent->queue->lock)
 {
 	int old;
-	struct fuse_ring_queue *queue = ring_req->queue;
+	struct fuse_ring_queue *queue = ring_ent->queue;
 	const struct fuse_conn *fc = queue->fc;
-	int tag = ring_req->tag;
+	int tag = ring_ent->tag;
 	int *value = is_bg ? &queue->req_bg : &queue->req_fg;
 
 	if (unlikely(*value <= 0)) {
 		pr_warn("%s bug: qid=%d tag=%d is_bg=%d "
 			"zero requests available fg=%d bg=%d\n",
-			str, queue->qid, ring_req->tag, is_bg,
+			str, queue->qid, ring_ent->tag, is_bg,
 			queue->req_bg, queue->req_fg);
 		WARN_ON(1);
 		return -EINVAL;
@@ -250,30 +250,30 @@ __must_hold(ring_req->queue->lock)
 		return -EIO;
 	}
 
-	ring_req->kbuf->flags = 0;
+	ring_ent->kbuf->flags = 0;
 
 	if (is_bg) {
-		ring_req->kbuf->flags |= FUSE_RING_REQ_FLAG_BACKGROUND;
+		ring_ent->kbuf->flags |= FUSE_RING_REQ_FLAG_BACKGROUND;
 		queue->req_bg--;
 	} else
 		queue->req_fg--;
 
 	pr_devel("%35s ring bit clear fc=%p is_bg=%d qid=%d tag=%d fg=%d bg=%d \n",
-		 str, fc, is_bg, queue->qid, ring_req->tag,
+		 str, fc, is_bg, queue->qid, ring_ent->tag,
 		 queue->req_fg, queue->req_bg);
 
-	ring_req->state |= FRRS_FUSE_REQ;
+	ring_ent->state |= FRRS_FUSE_REQ;
 
 	return 0;
 }
 
 /*
- * Take the next (first) entry from the queue list and assign it to the given
- * request
+ * Assign a fuse queue entry to the given entry
+ *
  */
-static bool fuse_dev_uring_get_list_entry(struct fuse_ring_req *ring_req,
-					  struct list_head *head,
-					  int is_bg)
+static bool fuse_dev_uring_assign_ring_entry(struct fuse_ring_ent *ring_ent,
+					     struct list_head *head,
+					     int is_bg)
 __must_hold(&queue.waitq.lock)
 {
 	struct fuse_req *req;
@@ -282,15 +282,15 @@ __must_hold(&queue.waitq.lock)
 	if (list_empty(head))
 		return false;
 
-	res = fuse_dev_uring_bit_clear(ring_req, is_bg, __func__);
+	res = fuse_dev_uring_bit_clear(ring_ent, is_bg, __func__);
 	if (unlikely(res))
 		return false;
 
 	req = list_first_entry(head, struct fuse_req, list);
 	list_del_init(&req->list);
 	clear_bit(FR_PENDING, &req->flags);
-	ring_req->fuse_req = req;
-	ring_req->need_req_end = 1;
+	ring_ent->fuse_req = req;
+	ring_ent->need_req_end = 1;
 
 	return true;
 }
@@ -299,7 +299,7 @@ int fuse_dev_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 {
 	struct fuse_ring_queue *queue;
 	int qid = 0;
-	struct fuse_ring_req *ring_req = NULL;
+	struct fuse_ring_ent *ring_ent = NULL;
 	const size_t queue_depth = fc->ring.queue_depth;
 	int res;
 	int is_bg = test_bit(FR_BACKGROUND, &req->flags);
@@ -332,10 +332,7 @@ int fuse_dev_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	if (*queue_avail) {
 		bool got_req;
 
-		/* the request was allocated from memory, but in the mean time
-		 * the queue has an empty slot  */
 		int tag = find_first_bit(queue->req_avail_map, queue_depth);
-
 		if (unlikely(tag == queue_depth)) {
 			pr_err("queue: no free bit found for qid=%d "
 				"qdepth=%zu av-fg=%d av-bg=%d max-fg=%zu "
@@ -347,17 +344,17 @@ int fuse_dev_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 			res = -ENOENT;
 			goto err_unlock;
 		}
-		ring_req = &queue->ring_req[tag];
-		got_req = fuse_dev_uring_get_list_entry(ring_req, head, is_bg);
+		ring_ent = &queue->ring_ent[tag];
+		got_req = fuse_dev_uring_assign_ring_entry(ring_ent, head, is_bg);
 		if (unlikely(!got_req)) {
 			WARN_ON(1);
-			ring_req = NULL;
+			ring_ent = NULL;
 		}
 	}
 	spin_unlock(&queue->lock);
 
-	if (ring_req != NULL)
-		fuse_dev_uring_send_to_ring(ring_req);
+	if (ring_ent != NULL)
+		fuse_dev_uring_send_to_ring(ring_ent);
 
 	return 0;
 
@@ -369,10 +366,10 @@ err_unlock:
 /*
  * Checks for errors and stores it into the request
  */
-static int fuse_dev_uring_ring_req_has_err(struct fuse_conn *fc,
-				       struct fuse_ring_req *ring_req)
+static int fuse_dev_uring_ring_ent_has_err(struct fuse_conn *fc,
+				       struct fuse_ring_ent *ring_ent)
 {
-	struct fuse_req *req = ring_req->fuse_req;
+	struct fuse_req *req = ring_ent->fuse_req;
 	struct fuse_out_header *oh = &req->out.h;
 	int err;
 
@@ -443,16 +440,16 @@ err:
  * request available again
  */
 static void fuse_dev_uring_commit_and_release(struct fuse_dev *fud,
-					      struct fuse_ring_req *ring_req)
+					      struct fuse_ring_ent *ring_ent)
 {
-	struct fuse_uring_buf_req *buf_req = ring_req->kbuf;
-	struct fuse_req *req = ring_req->fuse_req;
+	struct fuse_uring_buf_req *buf_req = ring_ent->kbuf;
+	struct fuse_req *req = ring_ent->fuse_req;
 	ssize_t err = 0;
 	bool set_err = false;
 
 	req->out.h = buf_req->out;
 
-	err = fuse_dev_uring_ring_req_has_err(fud->fc, ring_req);
+	err = fuse_dev_uring_ring_ent_has_err(fud->fc, ring_ent);
 	if (err) {
 		/* req->out.h.error already set */
 		pr_devel("%s:%d err=%zd oh->err=%d \n", __func__, __LINE__,
@@ -467,7 +464,7 @@ static void fuse_dev_uring_commit_and_release(struct fuse_dev *fud,
 out:
 	pr_devel("%s:%d ret=%zd op=%d req-ret=%d\n",
 		 __func__, __LINE__, err, req->args->opcode, req->out.h.error);
-	fuse_uring_request_end(ring_req, set_err, err);
+	fuse_uring_entuest_end(ring_ent, set_err, err);
 	return;
 }
 
@@ -478,7 +475,7 @@ out:
  */
 static void fuse_uring_shutdown_release_req(struct fuse_conn *fc,
 					    struct fuse_ring_queue *queue,
-					    struct fuse_ring_req *rreq)
+					    struct fuse_ring_ent *rreq)
 __must_hold(&fc->ring.start_stop_lock)
 __must_hold(&queue->lock)
 {
@@ -507,7 +504,7 @@ __must_hold(&queue->lock)
 
 		if (rreq->need_req_end) {
 			spin_unlock(&queue->lock);
-			fuse_uring_request_end(rreq, true, -ENOTCONN);
+			fuse_uring_entuest_end(rreq, true, -ENOTCONN);
 			spin_lock(&queue->lock);
 		}
 		may_release = true;
@@ -536,7 +533,7 @@ out:
  * Release a ring request, it is no longer needed and can handle new data
  *
  */
-static void _fuse_dev_uring_req_release_locked(struct fuse_ring_req *ring_req,
+static void _fuse_dev_uring_ent_release_locked(struct fuse_ring_ent *ring_ent,
 					      struct fuse_ring_queue *queue,
 					      bool bg)
 __must_hold(&queue->lock)
@@ -545,46 +542,46 @@ __must_hold(&queue->lock)
 
 	/* unsets all previous flags - basically resets */
 	pr_devel("%s fc=%p qid=%d tag=%d state=%llu bg=%d\n",
-		__func__, fc, ring_req->queue->qid, ring_req->tag,
-		ring_req->state, bg);
+		__func__, fc, ring_ent->queue->qid, ring_ent->tag,
+		ring_ent->state, bg);
 
-	if (ring_req->state & FRRS_USERSPACE) {
+	if (ring_ent->state & FRRS_USERSPACE) {
 		pr_warn("%s qid=%d tag=%d state=%llu is_bg=%d\n",
-			__func__, ring_req->queue->qid, ring_req->tag,
-			ring_req->state, bg);
+			__func__, ring_ent->queue->qid, ring_ent->tag,
+			ring_ent->state, bg);
 		WARN_ON(1);
 		return;
 	}
 
-	fuse_dev_uring_bit_set(ring_req, bg, __func__);
+	fuse_dev_uring_bit_set(ring_ent, bg, __func__);
 
 	/* Check if this is call through shutdown/release task and already and
 	 * the request is about to be released - the state must not be reset
 	 * then, as state FRRS_FUSE_WAIT would introduce a double
 	 * io_uring_cmd_done
 	 */
-	if (ring_req->state & FRRS_FREEING)
+	if (ring_ent->state & FRRS_FREEING)
 		return;
 
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
-	ring_req->kbuf->flags = 0;
-	ring_req->state = FRRS_FUSE_WAIT;
+	ring_ent->kbuf->flags = 0;
+	ring_ent->state = FRRS_FUSE_WAIT;
 }
 
 /*
- * Release a uring request, called internally of dev_uring
+ * Release a uring entry, called internally of dev_uring
  */
-static bool fuse_dev_uring_req_release(struct fuse_ring_req *ring_req)
+static bool fuse_dev_uring_ent_release(struct fuse_ring_ent *ring_ent)
 {
-	struct fuse_ring_queue *queue = ring_req->queue;
-	bool is_bg = !!(ring_req->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
+	struct fuse_ring_queue *queue = ring_ent->queue;
+	bool is_bg = !!(ring_ent->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
 	bool send = false;
 	struct list_head *head = is_bg ? &queue->bg_queue : &queue->fg_queue;
 
-	spin_lock(&ring_req->queue->lock);
-	_fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
-	send = fuse_dev_uring_get_list_entry(ring_req, head, is_bg);
-	spin_unlock(&ring_req->queue->lock);
+	spin_lock(&ring_ent->queue->lock);
+	_fuse_dev_uring_ent_release_locked(ring_ent, queue, is_bg);
+	send = fuse_dev_uring_assign_ring_entry(ring_ent, head, is_bg);
+	spin_unlock(&ring_ent->queue->lock);
 
 	return send;
 }
@@ -592,10 +589,10 @@ static bool fuse_dev_uring_req_release(struct fuse_ring_req *ring_req)
 /*
  * FUSE_URING_REQ_FETCH command handling
  */
-static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
+static int fuse_dev_uring_fetch(struct fuse_ring_ent *ring_ent,
 				struct io_uring_cmd *cmd)
 {
-	struct fuse_ring_queue *queue = ring_req->queue;
+	struct fuse_ring_queue *queue = ring_ent->queue;
 	struct fuse_conn *fc = queue->fc;
 	int ret;
 	bool is_bg = false;
@@ -606,7 +603,7 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 	/* register requests for foreground requests first, then backgrounds */
 	if (queue->req_fg >= fc->ring.max_fg)
 		is_bg = true;
-	_fuse_dev_uring_req_release_locked(ring_req, queue, is_bg);
+	_fuse_dev_uring_ent_release_locked(ring_ent, queue, is_bg);
 
 	/* daemon side registered all requests, this queue is complete */
 	if (queue->req_fg + queue->req_bg == fc->ring.queue_depth)
@@ -619,26 +616,26 @@ static int fuse_dev_uring_fetch(struct fuse_ring_req *ring_req,
 		 * check before */
 		WARN_ON(1);
 		pr_info("qid=%d tag=%d request counter (fg=%d bg=%d exceeds "
-			"queue-depth=%zu", queue->qid, ring_req->tag,
+			"queue-depth=%zu", queue->qid, ring_ent->tag,
 			queue->req_fg, queue->req_bg, fc->ring.queue_depth);
 		ret = -ERANGE;
 
 		/* avoid completion through fuse_req_end, as there is no
 		 * fuse req assigned yet
 		 */
-		ring_req->state = FRRS_INIT;
+		ring_ent->state = FRRS_INIT;
 	}
 
 	pr_devel("%s:%d qid=%d tag=%d nr-fg=%d nr-bg=%d nr_queue_init=%d\n",
 		__func__, __LINE__,
-		queue->qid, ring_req->tag, queue->req_fg, queue->req_bg,
+		queue->qid, ring_ent->tag, queue->req_fg, queue->req_bg,
 		nr_queue_init);
 
 	spin_unlock(&queue->lock);
 	if (ret)
 		goto out; /* ERANGE */
 
-	WRITE_ONCE(ring_req->cmd, cmd);
+	WRITE_ONCE(ring_ent->cmd, cmd);
 
 	if (nr_queue_init == fc->ring.nr_queues)
 		fc->ring.ready = 1;
@@ -718,7 +715,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct fuse_dev *fud = fuse_get_dev(cmd->file);
 	struct fuse_conn *fc = fud->fc;
 	struct fuse_ring_queue *queue;
-	struct fuse_ring_req *ring_req = NULL;
+	struct fuse_ring_ent *ring_ent = NULL;
 	u32 cmd_op = cmd->cmd_op;
 	u64 prev_state;
 	int ret = 0;
@@ -729,11 +726,11 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		goto out;
 	}
 
-	ring_req = &queue->ring_req[cmd_req->tag];
+	ring_ent = &queue->ring_ent[cmd_req->tag];
 
 	pr_devel("%s:%d received: cmd op %d qid %d (%p) tag %d  (%p)\n",
 		 __func__, __LINE__,
-		 cmd_op, cmd_req->qid, queue, cmd_req->tag, ring_req);
+		 cmd_op, cmd_req->qid, queue, cmd_req->tag, ring_ent);
 
 	spin_lock(&queue->lock);
 	if (unlikely(queue->aborted)) {
@@ -748,10 +745,10 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		goto out;
 	}
 
-	prev_state = ring_req->state;
-	ring_req->state |= FRRS_FUSE_FETCH_COMMIT;
-	ring_req->state &= ~FRRS_USERSPACE;
-	ring_req->need_cmd_done = 1;
+	prev_state = ring_ent->state;
+	ring_ent->state |= FRRS_FUSE_FETCH_COMMIT;
+	ring_ent->state &= ~FRRS_USERSPACE;
+	ring_ent->need_cmd_done = 1;
 	spin_unlock(&queue->lock);
 
 	switch (cmd_op) {
@@ -766,7 +763,7 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 			/* XXX error injection or test with malicious daemon */
 		}
 
-		ret = fuse_dev_uring_fetch(ring_req, cmd);
+		ret = fuse_dev_uring_fetch(ring_ent, cmd);
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
 		if (unlikely(!fc->ring.ready)) {
@@ -776,15 +773,15 @@ int fuse_dev_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 
 		if (!(prev_state & FRRS_USERSPACE)) {
 			pr_info("qid=%d tag=%d Invalid request state %llu, "
-				"missing %d \n", queue->qid, ring_req->tag,
-				ring_req->state, FRRS_USERSPACE);
+				"missing %d \n", queue->qid, ring_ent->tag,
+				ring_ent->state, FRRS_USERSPACE);
 			goto out;
 		}
 
 		/* XXX Test inject error */
 
-		WRITE_ONCE(ring_req->cmd, cmd);
-		fuse_dev_uring_commit_and_release(fud, ring_req);
+		WRITE_ONCE(ring_ent->cmd, cmd);
+		fuse_dev_uring_commit_and_release(fud, ring_ent);
 
 		ret = 0;
 		break;
@@ -799,10 +796,10 @@ out:
 		 cmd_op, cmd_req->qid, cmd_req->tag, ret);
 
 	if (ret < 0) {
-		if (ring_req != NULL) {
+		if (ring_ent != NULL) {
 			spin_lock(&queue->lock);
-			ring_req->state |= (FRRS_CMD_ERR | FRRS_USERSPACE);
-			ring_req->need_cmd_done = 0;
+			ring_ent->state |= (FRRS_CMD_ERR | FRRS_USERSPACE);
+			ring_ent->need_cmd_done = 0;
 			spin_unlock(&queue->lock);
 		}
 		io_uring_cmd_done(cmd, ret, 0);
@@ -836,7 +833,7 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 			continue;
 
 		for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-			struct fuse_ring_req *rreq = &queue->ring_req[tag];
+			struct fuse_ring_ent *rreq = &queue->ring_ent[tag];
 			if (rreq->need_cmd_done) {
 				pr_warn("fc=%p qid=%d tag=%d cmd not done\n",
 					fc, qid, tag);
@@ -893,7 +890,7 @@ __must_hold(&queue->lock)
 		return;
 
 	for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-		struct fuse_ring_req *rreq = &queue->ring_req[tag];
+		struct fuse_ring_ent *rreq = &queue->ring_ent[tag];
 		fuse_uring_shutdown_release_req(fc, queue, rreq);
 	}
 }
@@ -1038,7 +1035,7 @@ __must_hold(fc->ring.stop_waitq.lock)
 	schedule_delayed_work(&fc->ring.stop_monitor,
 			      FURING_DAEMON_MON_PERIOD);
 
-	req_sz = cfg->queue_depth * sizeof(struct fuse_ring_req);
+	req_sz = cfg->queue_depth * sizeof(struct fuse_ring_ent);
 	fc->ring.nr_queues = cfg->nr_queues;
 	fc->ring.queue_depth = cfg->queue_depth;
 	fc->ring.per_core_queue = cfg->nr_queues > 1;
@@ -1102,20 +1099,20 @@ __must_hold(fc->ring.stop_waitq.lock)
 	}
 
 	for (tag = 0; tag < fc->ring.queue_depth; tag++) {
-		struct fuse_ring_req *req = &queue->ring_req[tag];
-		req->queue = queue;
-		req->tag = tag;
-		req->fuse_req = NULL;
-		req->kbuf = (struct fuse_uring_buf_req *)buf;
+		struct fuse_ring_ent *ent = &queue->ring_ent[tag];
+		ent->queue = queue;
+		ent->tag = tag;
+		ent->fuse_req = NULL;
+		ent->kbuf = (struct fuse_uring_buf_req *)buf;
 
 		pr_devel("initialize qid=%d tag=%d queue=%p req=%p",
-			 qid, tag, queue, req);
+			 qid, tag, queue, ent);
 
-		req->kbuf->flags = 0;
+		ent->kbuf->flags = 0;
 
-		req->state = FRRS_INIT;
-		req->need_cmd_done = 0;
-		req->need_req_end = 0;
+		ent->state = FRRS_INIT;
+		ent->need_cmd_done = 0;
+		ent->need_req_end = 0;
 		fc->ring.queue_refs++;
 		buf += fc->ring.req_buf_sz;
 	}

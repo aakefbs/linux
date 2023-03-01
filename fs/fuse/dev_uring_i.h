@@ -13,7 +13,7 @@
 
 int fuse_dev_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req);
 void fuse_dev_uring_commit_release(struct fuse_dev *fud,
-			  struct fuse_ring_req *ring_req);
+			  struct fuse_ring_ent *ring_req);
 
 void fuse_uring_end_requests(struct fuse_conn *fc);
 
