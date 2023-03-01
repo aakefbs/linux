@@ -32,7 +32,7 @@
 /* default monitor interval for a dying daemon */
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
 
-static bool fuse_uring_ent_release(struct fuse_ring_ent *ring_ent);
+static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent);
 static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent);
 
 
@@ -50,10 +50,13 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 }
 
 /*
+ * Finalize a ring request, then fetch and send the next entry, if available
+ *
  * has lock/unlock/lock to avoid holding the lock on calling fuse_request_end
  */
 static void
-fuse_uring_entuest_end(struct fuse_ring_ent *ring_ent, bool set_err, int error)
+fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
+				int error)
 {
 	bool already = false;
 	struct fuse_req *req = ring_ent->fuse_req;
@@ -81,12 +84,10 @@ fuse_uring_entuest_end(struct fuse_ring_ent *ring_ent, bool set_err, int error)
 	if (set_err)
 		req->out.h.error = error;
 
-	pr_devel("Ending req %p\n", ring_ent->fuse_req);
 	fuse_request_end(ring_ent->fuse_req);
 	ring_ent->fuse_req = NULL;
 
-	send = fuse_uring_ent_release(ring_ent);
-
+	send = fuse_uring_ent_release_and_fetch(ring_ent);
 	if (send)
 		fuse_uring_send_to_ring(ring_ent);
 }
@@ -193,7 +194,7 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent)
 	return;
 
 err:
-	fuse_uring_entuest_end(ring_ent, true, err);
+	fuse_uring_req_end_and_get_next(ring_ent, true, err);
 }
 
 static void fuse_uring_bit_set(struct fuse_ring_ent *ring_ent, bool bg,
@@ -464,7 +465,7 @@ static void fuse_uring_commit_and_release(struct fuse_dev *fud,
 out:
 	pr_devel("%s:%d ret=%zd op=%d req-ret=%d\n",
 		 __func__, __LINE__, err, req->args->opcode, req->out.h.error);
-	fuse_uring_entuest_end(ring_ent, set_err, err);
+	fuse_uring_req_end_and_get_next(ring_ent, set_err, err);
 	return;
 }
 
@@ -504,7 +505,7 @@ __must_hold(&queue->lock)
 
 		if (rreq->need_req_end) {
 			spin_unlock(&queue->lock);
-			fuse_uring_entuest_end(rreq, true, -ENOTCONN);
+			fuse_uring_req_end_and_get_next(rreq, true, -ENOTCONN);
 			spin_lock(&queue->lock);
 		}
 		may_release = true;
@@ -569,9 +570,9 @@ __must_hold(&queue->lock)
 }
 
 /*
- * Release a uring entry, called internally of dev_uring
+ * Release a uring entry and fetch the next fuse request if available
  */
-static bool fuse_uring_ent_release(struct fuse_ring_ent *ring_ent)
+static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent)
 {
 	struct fuse_ring_queue *queue = ring_ent->queue;
 	bool is_bg = !!(ring_ent->kbuf->flags & FUSE_RING_REQ_FLAG_BACKGROUND);
