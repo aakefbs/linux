@@ -2254,7 +2254,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		fuse_dev_end_requests(&to_end);
 
 		mutex_lock(&fc->ring.start_stop_lock);
-		if (!fc->ring.queues_stopped) {
+		if (fc->ring.configured && !fc->ring.queues_stopped) {
 			fuse_uring_end_requests(fc);
 			schedule_delayed_work(&fc->ring.stop_monitor, 0);
 		}
@@ -2273,18 +2273,20 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	// wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 
 	/* XXX/FIXME use struct completion */
-	while (true) {
-		bool may_break = false;
-		wait_event(fc->ring.stop_waitq,
-			   READ_ONCE(fc->ring.queue_refs) == 0);
+	if (fc->ring.configured) {
+		while (true) {
+			bool may_break = false;
+			wait_event(fc->ring.stop_waitq,
+				   READ_ONCE(fc->ring.queue_refs) == 0);
 
-		mutex_lock(&fc->ring.start_stop_lock);
-		if (fc->ring.queues_stopped)
-			may_break = true;
-		mutex_unlock(&fc->ring.start_stop_lock);
+			mutex_lock(&fc->ring.start_stop_lock);
+			if (fc->ring.queues_stopped)
+				may_break = true;
+			mutex_unlock(&fc->ring.start_stop_lock);
 
-		if (may_break)
-			break;
+			if (may_break)
+				break;
+		}
 	}
 }
 

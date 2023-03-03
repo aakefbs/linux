@@ -957,12 +957,9 @@ static void fuse_uring_stop_mon(struct work_struct *work)
 		fuse_uring_stop_queues(fc);
 	}
 
-	if (!fc->ring.queues_stopped) {
-		pr_info("%s fc=%p schedule stop_mon\n", __func__, fc);
+	if (!fc->ring.queues_stopped)
 		schedule_delayed_work(&fc->ring.stop_monitor,
 				      FURING_DAEMON_MON_PERIOD);
-	} else
-		pr_devel("%s fc=%p not scheduling, queues stopped\n", __func__, fc);
 
 	mutex_unlock(&fc->ring.start_stop_lock);
 }
@@ -1181,12 +1178,15 @@ static int fuse_uring_wait_stop(struct fuse_conn *fc)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 
+	pr_devel("%s stop_requested=%d", __func__, fc->ring.stop_requested);
+
 	if (fc->ring.stop_requested)
 		return -EINTR;
 
 	/* This userspace thread can stop uring on process stop, no need
 	 * for the interval worker
 	 */
+	pr_devel("%s cancel stop monitor\n", __func__);
 	cancel_delayed_work_sync(&fc->ring.stop_monitor);
 
 	wait_event_interruptible_exclusive(fc->ring.stop_waitq,
