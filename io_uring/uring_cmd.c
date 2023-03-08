@@ -110,6 +110,18 @@ int io_uring_cmd_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	return 0;
 }
 
+static bool io_uring_cmd_supported(struct io_ring_ctx *ctx, struct file *file)
+{
+	/* no issue method, fail */
+	if (!file->f_op->uring_cmd)
+		return false;
+	/* IOPOLL enabled and no poll method, fail */
+	if (ctx->flags & IORING_SETUP_IOPOLL && !file->f_op->uring_cmd_iopoll)
+		return false;
+
+	return true;
+}
+
 int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
 {
 	struct io_uring_cmd *ioucmd = io_kiocb_to_cmd(req, struct io_uring_cmd);
@@ -117,7 +129,7 @@ int io_uring_cmd(struct io_kiocb *req, unsigned int issue_flags)
 	struct file *file = req->file;
 	int ret;
 
-	if (!file->f_op->uring_cmd)
+	if (!io_uring_cmd_supported(ctx, file))
 		return -EOPNOTSUPP;
 
 	ret = security_uring_cmd(ioucmd);
