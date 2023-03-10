@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -2231,6 +2232,11 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->lock);
 
 		fuse_dev_end_requests(&to_end);
+
+		mutex_lock(&fc->ring.start_stop_lock);
+		if (fc->ring.configured && !fc->ring.queues_stopped)
+			fuse_uring_end_requests(fc);
+		mutex_unlock(&fc->ring.start_stop_lock);
 	} else {
 		spin_unlock(&fc->lock);
 	}
@@ -2368,8 +2374,26 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
 	return fuse_backing_close(fud->fc, backing_id);
 }
 
-static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
-			   unsigned long arg)
+static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
+{
+	int res;
+	struct fuse_uring_cfg ring_conf;
+	struct fuse_dev *fud;
+
+	res = copy_from_user(&ring_conf, (void *)argp, sizeof(ring_conf));
+	if (res != 0)
+		return -EFAULT;
+
+	fud = fuse_get_dev(file);
+	if (!fud)
+		return -EPERM;
+
+	return _fuse_uring_ioctl(file, &ring_conf);
+}
+
+static long
+fuse_dev_ioctl(struct file * file, unsigned int cmd,
+	       unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
 
@@ -2383,8 +2407,10 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	case FUSE_DEV_IOC_BACKING_CLOSE:
 		return fuse_dev_ioctl_backing_close(file, argp);
 
-	default:
-		return -ENOTTY;
+	case FUSE_DEV_IOC_URING:
+		return fuse_uring_ioctl(file, argp);
+
+	default : return -ENOTTY;
 	}
 }
 
