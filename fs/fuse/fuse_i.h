@@ -531,6 +531,177 @@ struct fuse_sync_bucket {
 	struct rcu_head rcu;
 };
 
+enum fuse_ring_req_state {
+
+	FRRS_INVALD = 0,
+
+	/* request is basially initialied */
+	FRRS_INIT = 1u << 0,
+
+	/* request is committed from user space and waiting for a new fuse req */
+	FRRS_FUSE_FETCH_COMMIT = 1u << 1,
+
+	/* The ring request waits for a new fuse request */
+	 FRRS_FUSE_WAIT = 1u << 2,
+
+	/* The ring req got assigned a fuse req */
+	FRRS_FUSE_REQ = 1u << 3,
+
+	/* request is in or on the way to user space */
+	FRRS_USERSPACE = 1u << 4,
+
+	/* process is in the process to get freed */
+	FRRS_FREEING   = 1u << 5,
+
+	/* fuse_req_end was already done */
+	FRRS_FUSE_REQ_END = 1u << 6,
+
+	/* And error in the uring cmd command receiving function
+	 * request will then go back to user space
+	 */
+	FRRS_CMD_ERR      = 1u << 7,
+
+	/* request is released */
+	FRRS_FREED = 1u << 8,
+};
+
+/** A fuse ring entry, part of the ring queue */
+struct fuse_ring_ent {
+	/* pointer to kernel request buffer, userspace side has direct access
+	 * to it through the mmaped buffer
+	 */
+	struct fuse_ring_req *rreq;
+
+	int tag;
+
+	struct fuse_ring_queue *queue;
+
+	/* state the request is currently in */
+	u64 state;
+
+	int need_cmd_done:1;
+	int need_req_end:1;
+
+	struct fuse_req *fuse_req; /* when a list request is handled */
+
+	struct io_uring_cmd *cmd;
+};
+
+/* IORING_MAX_ENTRIES */
+#define FUSE_URING_MAX_QUEUE_DEPTH 32768
+
+struct fuse_ring_queue {
+	unsigned long flags;
+
+	struct fuse_conn *fc;
+
+	int qid;
+
+	/* This bitmap holds, which entries are available in the fuse_ring_ent
+	 * array.
+	 * XXX: Is there a way to make this dynamic
+	 */
+	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
+
+	/* available number of foreground requests  */
+	int req_fg;
+
+	/* available number of background requests */
+	int req_bg;
+
+	/* queue lock, taken when any value in the queue changes _and_ also
+	 * a ring entry state changes.
+	 */
+	spinlock_t lock;
+
+	/* per queue memory buffer that is divided per request */
+	char *queue_req_buf;
+
+	struct list_head bg_queue;
+	struct list_head fg_queue;
+
+	int configured:1;
+	int aborted:1;
+
+	/* size depends on queue depth */
+	struct fuse_ring_ent ring_ent[] ____cacheline_aligned_in_smp;
+};
+
+/**
+ * Describes if uring is for communication and holds alls the data needed
+ * for uring communication
+ */
+struct fuse_ring {
+
+	/* number of ring queues */
+	size_t nr_queues;
+
+	/* number of entries per queue */
+	size_t queue_depth;
+
+	/* max arg size for a request */
+	size_t req_arg_len;
+
+	/* req_arg_len + sizeof(struct fuse_req) */
+	size_t req_buf_sz;
+
+	/* max number of background requests per queue */
+	size_t max_bg;
+
+	/* max number of foreground requests */
+	size_t max_fg;
+
+	/* size of struct fuse_ring_queue + queue-depth * entry-size */
+	size_t queue_size;
+
+	/* buffer size per queue, that is used per queue entry */
+	size_t queue_buf_size;
+
+	/* When zero the queue can be freed on destruction */
+	int queue_refs;
+
+	/* Hold ring requests */
+	struct fuse_ring_queue *queues;
+
+	/* number of initialized queues with the ioctl */
+	int nr_queues_ioctl_init;
+
+	/* number of initialized queues with the uring cmd */
+	atomic_t nr_queues_cmd_init;
+
+	/* one queue per core or a single queue only ? */
+	unsigned int per_core_queue:1;
+
+	/* userspace sent a stop ioctl */
+	unsigned int stop_requested:1;
+
+	/* Is the ring completely iocl configured */
+	unsigned int configured:1;
+
+	/* Is the ring read to take requests */
+	unsigned int ready:1;
+
+	/* used on shutdown */
+	unsigned int queues_stopped:1;
+
+	/* userspace process */
+	struct task_struct *daemon;
+
+	struct mutex start_stop_lock;
+
+	/* userspace has a special thread that exists only to wait
+	 * in the kernel for process stop, to release uring
+	 */
+	wait_queue_head_t stop_waitq;
+
+	/* The daemon might get killed and uring then needs
+	 * to be released without getting a umount notification, this
+	 * workqueue exists to release uring even without a process
+	 * being hold in the stop_waitq
+	 */
+	struct delayed_work stop_monitor;
+};
+
 /**
  * A Fuse connection.
  *
@@ -841,6 +1012,13 @@ struct fuse_conn {
 
 	/* New writepages go into this bucket */
 	struct fuse_sync_bucket __rcu *curr_bucket;
+
+	/*
+	 * XXX Move to struct fuse_dev?
+	 * XXX Allocate dynamically?
+	 */
+	/**  uring connection information*/
+	struct fuse_ring ring;
 };
 
 /*
