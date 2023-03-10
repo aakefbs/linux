@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -2173,6 +2174,11 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->lock);
 
 		fuse_dev_end_requests(&to_end);
+
+		mutex_lock(&fc->ring.start_stop_lock);
+		if (fc->ring.configured && !fc->ring.queues_stopped)
+			fuse_uring_end_requests(fc);
+		mutex_unlock(&fc->ring.start_stop_lock);
 	} else {
 		spin_unlock(&fc->lock);
 	}
@@ -2249,6 +2255,7 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	int res;
 	int oldfd;
 	struct fuse_dev *fud = NULL;
+	struct fuse_uring_cfg ring_conf;
 
 	switch (cmd) {
 	case FUSE_DEV_IOC_CLONE:
@@ -2273,6 +2280,20 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 				fput(old);
 			}
 		}
+		break;
+	case FUSE_DEV_IOC_URING:
+		/* XXX fud ensures fc->ring.start_stop_lock is initialized? */
+		fud = fuse_get_dev(file);
+		if (fud) {
+			res = copy_from_user(&ring_conf, (void *)arg,
+					     sizeof(ring_conf));
+			if (res == 0)
+				res = fuse_uring_ioctl(file, &ring_conf);
+			else
+				res = -EFAULT;
+		} else
+			pr_info("%s: Did not get fud\n", __func__);
+
 		break;
 	default:
 		res = -ENOTTY;

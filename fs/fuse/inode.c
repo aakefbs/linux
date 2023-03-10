@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -854,6 +855,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->user_ns = get_user_ns(user_ns);
 	fc->max_pages = FUSE_DEFAULT_MAX_PAGES_PER_REQ;
 	fc->max_pages_limit = FUSE_MAX_MAX_PAGES;
+
+	mutex_init(&fc->ring.start_stop_lock);
+	fc->ring.daemon = NULL;
 
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);
@@ -1787,6 +1791,9 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 		fuse_ctl_remove_conn(fc);
 		mutex_unlock(&fuse_mutex);
 	}
+
+	if (fc->ring.daemon != NULL)
+		fuse_uring_ring_destruct(fc);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_destroy);
 
