@@ -10,8 +10,8 @@
 #include "fuse_i.h"
 
 void fuse_uring_end_requests(struct fuse_conn *fc);
-void fuse_uring_ring_destruct(struct fuse_conn *fc);
 int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg);
+void fuse_uring_ring_destruct(struct fuse_conn *fc);
 #endif
 
 
