@@ -2176,9 +2176,12 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		fuse_dev_end_requests(&to_end);
 
 		mutex_lock(&fc->ring.start_stop_lock);
-		if (fc->ring.configured && !fc->ring.queues_stopped)
+		if (fc->ring.configured && !fc->ring.queues_stopped) {
 			fuse_uring_end_requests(fc);
+			schedule_delayed_work(&fc->ring.stop_monitor, 0);
+		}
 		mutex_unlock(&fc->ring.start_stop_lock);
+
 	} else {
 		spin_unlock(&fc->lock);
 	}
@@ -2189,7 +2192,14 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 {
 	/* matches implicit memory barrier in fuse_drop_waiting() */
 	smp_mb();
+
 	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
+
+	/* XXX use struct completion? */
+	if (fc->ring.daemon != NULL) {
+		schedule_delayed_work(&fc->ring.stop_monitor, 0);
+		wait_event(fc->ring.stop_waitq, fc->ring.queues_stopped == 1);
+	}
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
