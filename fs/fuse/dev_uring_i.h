@@ -10,6 +10,7 @@
 #include "fuse_i.h"
 
 void fuse_uring_end_requests(struct fuse_conn *fc);
+int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req);
 int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg);
 void fuse_uring_ring_destruct(struct fuse_conn *fc);
 int fuse_uring_mmap(struct file *filp, struct vm_area_struct *vma);
