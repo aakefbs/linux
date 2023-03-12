@@ -330,6 +330,74 @@ __must_hold(&queue.waitq.lock)
 	return true;
 }
 
+int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
+{
+	struct fuse_ring_queue *queue;
+	int qid = 0;
+	struct fuse_ring_ent *ring_ent = NULL;
+	const size_t queue_depth = fc->ring.queue_depth;
+	int res;
+	int is_bg = test_bit(FR_BACKGROUND, &req->flags);
+	struct list_head *head;
+	int *queue_avail;
+
+	pr_devel("%s req=%p bg=%d\n", __func__, req, is_bg);
+
+	if (fc->ring.per_core_queue) {
+		qid = task_cpu(current);
+		if (unlikely(qid >= fc->ring.nr_queues)) {
+			WARN_ONCE(1, "Core number (%u) exceeds nr ueues (%zu)\n",
+				  qid, fc->ring.nr_queues);
+			qid = 0;
+		}
+	}
+
+	queue = fuse_uring_get_queue(fc, qid);
+	head = is_bg ?  &queue->bg_queue : &queue->fg_queue;
+	queue_avail = is_bg ? &queue->req_bg : &queue->req_fg;
+
+	spin_lock(&queue->lock);
+
+	if (unlikely(queue->aborted)) {
+		res = -ENOTCONN;
+		goto err_unlock;
+	}
+
+	list_add_tail(&req->list, head);
+	if (*queue_avail) {
+		bool got_req;
+		int tag = find_first_bit(queue->req_avail_map, queue_depth);
+
+		if (unlikely(tag == queue_depth)) {
+			pr_err("queue: no free bit found for qid=%d "
+				"qdepth=%zu av-fg=%d av-bg=%d max-fg=%zu "
+				"max-bg=%zu is_bg=%d\n", queue->qid,
+				queue_depth, queue->req_fg, queue->req_bg,
+				fc->ring.max_fg, fc->ring.max_bg, is_bg);
+
+			WARN_ON(1);
+			res = -ENOENT;
+			goto err_unlock;
+		}
+		ring_ent = &queue->ring_ent[tag];
+		got_req = fuse_uring_assign_ring_entry(ring_ent, head, is_bg);
+		if (unlikely(!got_req)) {
+			WARN_ON(1);
+			ring_ent = NULL;
+		}
+	}
+	spin_unlock(&queue->lock);
+
+	if (ring_ent != NULL)
+		fuse_uring_send_to_ring(ring_ent);
+
+	return 0;
+
+err_unlock:
+	spin_unlock(&queue->lock);
+	return res;
+}
+
 /*
  * Checks for errors and stores it into the request
  */
