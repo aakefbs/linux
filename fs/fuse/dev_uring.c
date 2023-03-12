@@ -425,6 +425,49 @@ unlock:
 	return rc;
 }
 
+/**
+ * Wait until uring shall be destructed and then release uring resources
+ */
+static int fuse_uring_wait_stop(struct fuse_conn *fc)
+{
+	struct fuse_iqueue *fiq = &fc->iq;
+
+	pr_devel("%s stop_requested=%d", __func__, fc->ring.stop_requested);
+
+	if (fc->ring.stop_requested)
+		return -EINTR;
+
+	/* This userspace thread can stop uring on process stop, no need
+	 * for the interval worker
+	 */
+	pr_devel("%s cancel stop monitor\n", __func__);
+	cancel_delayed_work_sync(&fc->ring.stop_monitor);
+
+	wait_event_interruptible(fc->ring.stop_waitq,
+				 !fiq->connected ||
+				 fc->ring.stop_requested);
+
+	/* The userspace task gets scheduled to back userspace, we need
+	 * the interval worker again. It runs immediately for quick cleanup
+	 * in shutdown/process kill.
+	 */
+
+	mutex_lock(&fc->ring.start_stop_lock);
+	if (!fc->ring.queues_stopped)
+		mod_delayed_work(system_wq, &fc->ring.stop_monitor, 0);
+	mutex_unlock(&fc->ring.start_stop_lock);
+
+	return 0;
+}
+
+static int fuse_uring_shutdown_wakeup(struct fuse_conn *fc)
+{
+	fc->ring.stop_requested = 1;
+	wake_up_all(&fc->ring.stop_waitq);
+
+	return 0;
+}
+
 int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 {
 	struct fuse_dev *fud = fuse_get_dev(file);
@@ -446,6 +489,10 @@ int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 	switch (cfg->cmd) {
 	case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
 		return fuse_uring_cfg(fc, cfg->qid, cfg);
+	case FUSE_URING_IOCTL_CMD_WAIT:
+		return fuse_uring_wait_stop(fc);
+	case FUSE_URING_IOCTL_CMD_STOP:
+		return fuse_uring_shutdown_wakeup(fc);
 	default:
 		return -EINVAL;
 	}
