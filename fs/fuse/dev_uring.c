@@ -499,3 +499,52 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 	fc->ring.queue_depth = 0;
 	fc->ring.nr_queues = 0;
 }
+
+/**
+ * fuse uring mmap, per ring qeuue. The queue is identified by the offset
+ * parameter
+ */
+int fuse_uring_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct fuse_dev *fud = fuse_get_dev(filp);
+	struct fuse_conn *fc = fud->fc;
+	size_t sz = vma->vm_end - vma->vm_start;
+	unsigned int qid;
+	int ret;
+	loff_t off;
+	struct fuse_ring_queue *queue;
+
+	/* check if uring is configured and if the requested size matches */
+	if (fc->ring.nr_queues == 0 || fc->ring.queue_depth == 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (sz != fc->ring.queue_buf_size) {
+		ret = -EINVAL;
+		pr_devel("mmap size mismatch, expected %zu got %zu\n",
+			 fc->ring.queue_buf_size, sz);
+		goto out;
+	}
+
+	/* XXX: Enforce a cloned session per ring and assign fud per queue
+	 * and use fud as key to find the right queue?
+	 */
+	off = (vma->vm_pgoff << PAGE_SHIFT) / PAGE_SIZE;
+	qid = off / (fc->ring.queue_depth);
+
+	queue = fuse_uring_get_queue(fc, qid);
+
+	if (queue == NULL) {
+		pr_devel("fuse uring mmap: invalid qid=%u\n", qid);
+		return -ERANGE;
+	}
+
+	ret = remap_vmalloc_range(vma, queue->queue_req_buf, 0);
+out:
+	pr_devel("%s: pid %d qid: %u addr: %p sz: %zu  ret: %d\n",
+		 __func__, current->pid, qid, (char *)vma->vm_start,
+		 sz, ret);
+
+	return ret;
+}

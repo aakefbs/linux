@@ -2325,6 +2325,7 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+	.mmap		= fuse_uring_mmap,
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 
