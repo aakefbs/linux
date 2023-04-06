@@ -606,8 +606,8 @@ struct fuse_ring_queue {
 	/* available number of foreground requests  */
 	int req_fg;
 
-	/* available number of background requests */
-	int req_bg;
+	/* available number of async requests */
+	int req_async;
 
 	/* queue lock, taken when any value in the queue changes _and_ also
 	 * a ring entry state changes.
@@ -617,7 +617,7 @@ struct fuse_ring_queue {
 	/* per queue memory buffer that is divided per request */
 	char *queue_req_buf;
 
-	struct list_head bg_queue;
+	struct list_head async_queue;
 	struct list_head fg_queue;
 
 	int configured:1;
@@ -646,7 +646,7 @@ struct fuse_ring {
 	size_t req_buf_sz;
 
 	/* max number of background requests per queue */
-	size_t max_bg;
+	size_t max_async;
 
 	/* max number of foreground requests */
 	size_t max_fg;
