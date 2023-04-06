@@ -337,7 +337,8 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	struct fuse_ring_ent *ring_ent = NULL;
 	const size_t queue_depth = fc->ring.queue_depth;
 	int res;
-	int async = test_bit(FR_BACKGROUND, &req->flags);
+	int async = test_bit(FR_BACKGROUND, &req->flags) &&
+		    !req->args->async_blocking;
 	struct list_head *head;
 	int *queue_avail;
 
