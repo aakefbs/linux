@@ -341,8 +341,17 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	struct list_head *head;
 	int *queue_avail;
 
+	/* async requests are best handled on another core, the current
+	 * core and do application/page handling the ring core can handle
+	 * async requests.
+	 * XXX This should be on the same numa node and not busy - is there
+	 * a scheduler function available  that could make this decision?
+	 */
+	short cpu_off = async ? 1 : 0;
 	if (fc->ring.per_core_queue) {
-		qid = task_cpu(current);
+
+		qid = (task_cpu(current) + cpu_off) % fc->ring.nr_queues;
+
 		if (unlikely(qid >= fc->ring.nr_queues)) {
 			WARN_ONCE(1, "Core number (%u) exceeds nr ueues (%zu)\n",
 				  qid, fc->ring.nr_queues);
