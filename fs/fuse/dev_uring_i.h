@@ -9,6 +9,13 @@
 
 #include "fuse_i.h"
 
+/* Minimal async size with uring communication. Async is handled on a different
+ * core and that has overhead, so the async queue is only used beginning
+ * with a certain size - XXX should this be a tunable parameter?
+ */
+#define FUSE_URING_MIN_RA_ASYNC_SIZE (16384)
+
+
 void fuse_uring_end_requests(struct fuse_conn *fc);
 int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req);
 int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg);
