@@ -343,8 +343,11 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	int *queue_avail;
 
 	/* async requests are best handled on another core, the current
-	 * core and do application/page handling the ring core can handle
-	 * async requests.
+	 * core can do application/page handling, while the async request
+	 * is handled on another core in userspace.
+	 * For sync request the application has to wait - no processing, so
+	 * the request should continue on the current core and avoid context
+	 * switches.
 	 * XXX This should be on the same numa node and not busy - is there
 	 * a scheduler avail that could make this decision?
 	 */
