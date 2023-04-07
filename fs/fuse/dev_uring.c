@@ -343,14 +343,26 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 		    !req->args->async_blocking;
 	struct list_head *head;
 	int *queue_avail;
+	int cpu_off;
+
+	if (async && req->args->opcode == FUSE_READ &&
+	    req->args->out_args[0].size < FUSE_URING_MIN_RA_ASYNC_SIZE)
+		async = 0;
+
+	pr_devel("opcode=%d out_size=%d async=%d\n",
+		req->args->opcode, req->args->out_args[0].size, async);
 
 	/* async requests are best handled on another core, the current
-	 * core and do application/page handling the ring core can handle
-	 * async requests.
+	 * core can do application/page handling, while the async request
+	 * is handled on another core in userspace.
+	 * For sync request the application has to wait - no processing, so
+	 * the request should continue on the current core and avoid context
+	 * switches.
 	 * XXX This should be on the same numa node and not busy - is there
 	 * a scheduler function available  that could make this decision?
 	 */
-	short cpu_off = async ? 1 : 0;
+	cpu_off = async ? 1 : 0;
+
 	if (fc->ring.per_core_queue) {
 
 		qid = (task_cpu(current) + cpu_off) % fc->ring.nr_queues;
