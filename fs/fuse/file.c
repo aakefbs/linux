@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -974,11 +975,20 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	struct fuse_conn *fc = fm->fc;
 	struct fuse_args_pages *ap = &ia->ap;
 	loff_t pos = page_offset(ap->pages[0]);
 	size_t count = ap->num_pages << PAGE_SHIFT;
 	ssize_t res;
 	int err;
+	unsigned async = fc->async_read;
+
+	/* sync request stay longer on the same core - important with uring
+	 * Check here and not only in dev_uring.c as we have control in
+	 * fuse_simple_request if it should wake up on the same core,
+	 * avoids application core switching */
+	if (async && fc->ring.ready && count <= FUSE_URING_MIN_RA_ASYNC_SIZE)
+		async = 0;
 
 	ap->args.out_pages = true;
 	ap->args.page_zeroing = true;
@@ -993,7 +1003,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
-	if (fm->fc->async_read) {
+	if (async) {
 		ia->ff = fuse_file_get(ff);
 		ap->args.end = fuse_readpages_end;
 		err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
