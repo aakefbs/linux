@@ -216,6 +216,9 @@ void fuse_finish_open(struct inode *inode, struct file *file)
 	}
 	if ((file->f_mode & FMODE_WRITE) && fc->writeback_cache)
 		fuse_link_write_file(file);
+
+	if (ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES)
+		file->f_mode |= FMODE_DIO_PARALLEL_WRITE;
 }
 
 int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
