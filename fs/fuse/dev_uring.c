@@ -747,6 +747,21 @@ static char *fuse_uring_alloc_queue_buf(int size, int node)
 	return buf ? buf : ERR_PTR(-ENOMEM);
 }
 
+/* Update conn limits according to ring values */
+static void fuse_uring_conn_cfg_limits(struct fuse_conn *fc)
+{
+	WRITE_ONCE(fc->max_pages,
+		   min_t(unsigned int, fc->max_pages,
+			      fc->ring.req_arg_len / PAGE_SIZE));
+
+	/* This not ideal, as multiplication with nr_queue assumes the limit
+	 * gets reached when all queues are used, but a single threaded
+	 * application might already do that.
+	 */
+	WRITE_ONCE(fc->max_background,
+		   fc->ring.nr_queues * fc->ring.max_async);
+}
+
 /**
  * Ring setup for this connection
  */
@@ -1147,8 +1162,10 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 
 	WRITE_ONCE(ring_ent->cmd, cmd);
 
-	if (nr_queue_init == fc->ring.nr_queues)
+	if (nr_queue_init == fc->ring.nr_queues) {
+		fuse_uring_conn_cfg_limits(fc);
 		fc->ring.ready = 1;
+	}
 
 out:
 	return ret;
