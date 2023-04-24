@@ -326,7 +326,11 @@ void fuse_request_end(struct fuse_req *req)
 		spin_unlock(&fc->bg_lock);
 	} else {
 		/* Wake up waiter sleeping in request_wait_answer() */
-		wake_up(&req->waitq);
+		if (fc->ring.ready) {
+			/* actually we would like to have wake_same_core */
+			wake_up_sync(&req->waitq);
+		} else
+			wake_up(&req->waitq);
 	}
 
 	if (test_bit(FR_ASYNC, &req->flags))
