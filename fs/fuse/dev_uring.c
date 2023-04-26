@@ -348,9 +348,29 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	int *queue_avail;
 	int cpu_off;
 
-	if (async && req->args->opcode == FUSE_READ &&
-	    req->args->out_args[0].size < FUSE_URING_MIN_RA_ASYNC_SIZE)
-		async = 0;
+	/* async has on a different core (see below) introduces context
+	 * switching - should be avoided for small requests
+	 */
+	if (async) {
+		size_t size;
+		switch (req->args->opcode) {
+		case FUSE_READ:
+			size = req->args->out_args[0].size;
+			break;
+		case FUSE_WRITE:
+			size = req->args->in_args[1].size;
+			break;
+		default:
+			/* FUSE_RELEASE - meta request - better served on the
+			 * current core and sync
+			 */
+			size = 0;
+		break;
+		}
+
+		if (size < FUSE_URING_MIN_ASYNC_SIZE)
+			async = 0;
+	}
 
 	pr_devel("opcode=%d out_size=%d async=%d\n",
 		req->args->opcode, req->args->out_args[0].size, async);
