@@ -13,7 +13,7 @@
  * core and that has overhead, so the async queue is only used beginning
  * with a certain size - XXX should this be a tunable parameter?
  */
-#define FUSE_URING_MIN_RA_ASYNC_SIZE (16384)
+#define FUSE_URING_MIN_ASYNC_SIZE (16384)
 
 
 void fuse_uring_end_requests(struct fuse_conn *fc);

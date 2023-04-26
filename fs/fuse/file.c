@@ -987,7 +987,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	 * Check here and not only in dev_uring.c as we have control in
 	 * fuse_simple_request if it should wake up on the same core,
 	 * avoids application core switching */
-	if (async && fc->ring.ready && count <= FUSE_URING_MIN_RA_ASYNC_SIZE)
+	if (async && fc->ring.ready && count <= FUSE_URING_MIN_ASYNC_SIZE)
 		async = 0;
 
 	ap->args.out_pages = true;
