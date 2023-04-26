@@ -325,8 +325,11 @@ void fuse_request_end(struct fuse_req *req)
 		flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
 	} else {
-		/* Wake up waiter sleeping in request_wait_answer() */
-		wake_up(&req->waitq);
+		if (fc->ring.per_core_queue) {
+			/* Wake up waiter sleeping in request_wait_answer() */
+			__wake_up_on_current_cpu(&req->waitq, TASK_NORMAL, NULL);
+		} else
+			wake_up(&req->waitq);
 	}
 
 	if (test_bit(FR_ASYNC, &req->flags))
@@ -413,7 +416,7 @@ static void request_wait_answer(struct fuse_req *req)
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
 out:
 	if (prev_cpu != task_cpu(current))
-		pr_info("%s cpu switch from=%d to=%d\n",
+		pr_devel("%s cpu switch from=%d to=%d\n",
 			__func__, prev_cpu, task_cpu(current));
 }
 
