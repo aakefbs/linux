@@ -386,6 +386,26 @@ static void request_wait_answer(struct fuse_req *req)
 	if (fc->ring.per_core_queue)
 		current->seesaw = 1;
 
+	/* When running over uring and core affined userspace threads, we
+	 * do not want to let migrate away the request submitting process.
+	 * Issue is that even after waking up on the right core, processes
+	 * that have submitted requests might get migrated away, because
+	 * the ring thread is still doing a bit of work or is in the process
+	 * to go to sleep. Assumption here is that processes are started on
+	 * the right core (i.e. idle cores) and can then stay on that core
+	 * when they come and do file system requests.
+	 * Another alternative way is to set SCHED_IDLE for ring threads,
+	 * but that would have an issue if there are other processes keeping
+	 * the cpu busy.
+	 * SCHED_IDLE or this hack here result in about factor 3.5 for
+	 * max meta request performance.
+	 *
+	 * Ideal would to tell the scheduler that ring threads are not disturbing
+	 * that migration away from it should very very rarely happen.
+	 */
+	if (fc->ring.ready)
+		migrate_disable();
+
 	if (!fc->no_interrupt) {
 		/* Any signal may interrupt this */
 		err = wait_event_interruptible(req->waitq,
