@@ -7605,6 +7605,17 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 	if (wake_flags & WF_TTWU) {
 		record_wakee(p);
 
+		/*
+		 * Current is handling requests on behalf of the waking process,
+		 * both want to run on the same core in seeswaw manner.
+		 * Typically current is bound to one core.'and only p is allowed
+		 * to freely move.
+		 */
+		if (p->seesaw_req && current->seesaw_proc  &&
+		    time_after(jiffies, p->seesaw_jiffies) &&
+		    cpumask_test_cpu(cpu, p->cpus_ptr))
+			return cpu;
+
 		if ((wake_flags & WF_CURRENT_CPU) &&
 		    cpumask_test_cpu(cpu, p->cpus_ptr))
 			return cpu;

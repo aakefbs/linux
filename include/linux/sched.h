@@ -953,6 +953,13 @@ struct task_struct {
 	/* delay due to memory thrashing */
 	unsigned                        in_thrashing:1;
 #endif
+	/* requesting task */
+	unsigned 			seesaw_req:1;
+	/* request processing task */
+	unsigned			seesaw_proc:1;
+
+	/* limit seesaw time slot */
+	unsigned long			seesaw_jiffies;
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
 
