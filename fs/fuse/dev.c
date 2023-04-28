@@ -414,6 +414,20 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Wait it out.
 	 */
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
+
+	/*
+	 * __wake_up_on_current_cpu ensures we wake up on the right core,
+	 * after that we still want to stay on the same core, shared with
+	 * a ring thread to submit next request to it. Issue without seesaw
+	 * is that the while the ring thread is on its way to wait, it disturbs
+	 * the application and application might get migrated away
+	 */
+	if (fc->ring.per_core_queue) {
+		current->seesaw_req = 1;
+		current->seesaw_jiffies = jiffies + 10;
+	}
+
+
 out:
 	if (prev_cpu != task_cpu(current))
 		pr_devel("%s cpu switch from=%d to=%d\n",
