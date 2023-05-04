@@ -376,6 +376,16 @@ static void request_wait_answer(struct fuse_req *req)
 	int err;
 	int prev_cpu = task_cpu(current);
 
+	/*
+	 * __wake_up_on_current_cpu ensures we wake up on the right core,
+	 * after that we still want to stay on the same core, shared with
+	 * a ring thread to submit next request to it. Issue without seesaw
+	 * is that the while the ring thread is on its way to wait, it disturbs
+	 * the application and application might get migrated away
+	 */
+	if (fc->ring.per_core_queue)
+		current->seesaw = 1;
+
 	if (!fc->no_interrupt) {
 		/* Any signal may interrupt this */
 		err = wait_event_interruptible(req->waitq,
@@ -415,23 +425,16 @@ static void request_wait_answer(struct fuse_req *req)
 	 */
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
 
-	/*
-	 * __wake_up_on_current_cpu ensures we wake up on the right core,
-	 * after that we still want to stay on the same core, shared with
-	 * a ring thread to submit next request to it. Issue without seesaw
-	 * is that the while the ring thread is on its way to wait, it disturbs
-	 * the application and application might get migrated away
-	 */
-	if (fc->ring.per_core_queue) {
-		current->seesaw_req = 1;
-		current->seesaw_jiffies = jiffies + 10;
-	}
-
-
 out:
+
+
+
+	pr_devel("%s seesaw=%u seesaw=%u\n",
+		__func__, current->seesaw, current->seesaw);
+
 	if (prev_cpu != task_cpu(current))
-		pr_devel("%s cpu switch from=%d to=%d\n",
-			__func__, prev_cpu, task_cpu(current));
+		pr_devel("%s task=%p cpu from=%d to=%d\n",
+			__func__, current, prev_cpu, task_cpu(current));
 }
 
 static void __fuse_request_send(struct fuse_req *req)
