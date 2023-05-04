@@ -7611,9 +7611,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 		 * Typically current is bound to one core.'and only p is allowed
 		 * to freely move.
 		 */
-		if (p->seesaw_req && current->seesaw_proc  &&
-		    time_after(jiffies, p->seesaw_jiffies) &&
-		    cpumask_test_cpu(cpu, p->cpus_ptr))
+		if (p->seesaw && current->seesaw)
 			return cpu;
 
 		if ((wake_flags & WF_CURRENT_CPU) &&

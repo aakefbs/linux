@@ -957,6 +957,7 @@ static int fuse_uring_cfg(struct fuse_conn *fc, unsigned int qid,
 			goto unlock;
 	}
 
+	/* XXX: Use cpu_to_node(), no need for numa_id in config */
 	rc = fuse_uring_queue_cfg(fc, qid, cfg->numa_node_id);
 
 unlock:
@@ -1315,14 +1316,15 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 			/* XXX error injection or test with malicious daemon */
 		}
 
+		ret = fuse_uring_fetch(ring_ent, cmd);
+
 		/* In combination with requesting process (application) seesaw
 		 * setting (see request_wait_answer), the application will
 		 * stay on the same core.
 		 */
 		if (fc->ring.per_core_queue)
-			current->seesaw_proc = 1;
+			current->seesaw = 1;
 
-		ret = fuse_uring_fetch(ring_ent, cmd);
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
 		if (unlikely(!fc->ring.ready)) {
