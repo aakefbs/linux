@@ -724,9 +724,9 @@ out_err:
 
 static int fuse_mknod(struct mnt_idmap *, struct inode *, struct dentry *,
 		      umode_t, dev_t);
-static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
-			    struct file *file, unsigned flags,
-			    umode_t mode)
+static int fuse_open_nonatomic(struct inode *dir, struct dentry *entry,
+			       struct file *file, unsigned flags,
+			       umode_t mode)
 {
 	int err;
 	struct fuse_conn *fc = get_fuse_conn(dir);
@@ -768,6 +768,172 @@ mknod:
 		goto out_dput;
 no_open:
 	return finish_no_open(file, res);
+}
+
+static int fuse_open_atomic(struct inode *dir, struct dentry *entry,
+			    struct file *file, unsigned flags,
+			    umode_t mode)
+{
+
+	int err;
+	struct inode *inode;
+	struct fuse_mount *fm = get_fuse_mount(dir);
+	struct fuse_conn *fc = fm->fc;
+	FUSE_ARGS(args);
+	struct fuse_forget_link *forget;
+	struct fuse_create_in inarg;
+	struct fuse_open_out outopen;
+	struct fuse_entry_out outentry;
+	struct fuse_inode *fi;
+	struct fuse_file *ff;
+	struct dentry *res = NULL;
+	struct fuse_in_arg sec_in_args = { .size = 0, .value = NULL };
+
+	/* Userspace expects S_IFREG in create mode */
+	if ((flags & O_CREAT) && (mode & S_IFMT) != S_IFREG) {
+		WARN_ON(1);
+		err = -EINVAL;
+		goto out_err;
+	}
+	forget = fuse_alloc_forget();
+	err = -ENOMEM;
+	if (!forget)
+		goto out_err;
+
+	err = -ENOMEM;
+	ff = fuse_file_alloc(fm);
+	if (!ff)
+		goto out_put_forget_req;
+
+	if (!fc->dont_mask)
+		mode &= ~current_umask();
+
+	flags &= ~O_NOCTTY;
+	memset(&inarg, 0, sizeof(inarg));
+	memset(&outentry, 0, sizeof(outentry));
+	inarg.flags = flags;
+	inarg.mode = mode;
+	inarg.umask = current_umask();
+
+	if (fc->handle_killpriv_v2 && (flags & O_TRUNC) &&
+	    !(flags & O_EXCL) && !capable(CAP_FSETID)) {
+		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
+	}
+
+	args.opcode = FUSE_OPEN_ATOMIC;
+	args.nodeid = get_node_id(dir);
+	args.in_numargs = 2;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.in_args[1].size = entry->d_name.len + 1;
+	args.in_args[1].value = entry->d_name.name;
+	args.out_numargs = 2;
+	args.out_args[0].size = sizeof(outentry);
+	args.out_args[0].value = &outentry;
+	args.out_args[1].size = sizeof(outopen);
+	args.out_args[1].value = &outopen;
+
+	if (fc->init_security) {
+		err = get_security_context(entry, mode, &sec_in_args);
+		if (err)
+			goto out_put_forget_req;
+
+		args.in_numargs = 3;
+		args.in_args[2].size = sec_in_args.size;
+		args.in_args[2].value = sec_in_args.value;
+	}
+
+	err = fuse_simple_request(fm, &args);
+	if (err == -ENOSYS) {
+		fc->no_open_atomic = 1;
+		fuse_file_free(ff);
+		kfree(forget);
+		goto fallback;
+	}
+	if (err) {
+		if (err == -ENOENT)
+			fuse_invalidate_entry_cache(entry);
+		goto out_free_ff;
+	}
+
+	err = -EIO;
+	if (invalid_nodeid(outentry.nodeid) || fuse_invalid_attr(&outentry.attr))
+		goto out_free_ff;
+
+	ff->fh = outopen.fh;
+	ff->nodeid = outentry.nodeid;
+	ff->open_flags = outopen.open_flags;
+	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
+			  &outentry.attr, entry_attr_timeout(&outentry), 0);
+	if (!inode) {
+		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+		fuse_sync_release(NULL, ff, flags);
+		fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
+		err = -ENOMEM;
+		goto out_err;
+	}
+	if (d_in_lookup(entry)) {
+		res = d_splice_alias(inode, entry);
+		if (res) {
+			if (IS_ERR(res)) {
+				/*
+				 * Close the file in user space, but do not unlink it,
+				 * if it was created - with network file systems other
+				 * clients might have already accessed it.
+				 */
+				fi = get_fuse_inode(inode);
+				fuse_sync_release(fi, ff, flags);
+				fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
+				err = PTR_ERR(res);
+				goto out_err;
+			}
+			entry = res;
+		}
+	} else
+		d_instantiate(entry, inode);
+	fuse_change_entry_timeout(entry, &outentry);
+	/* This should be always set when the file is created */
+	if (outopen.open_flags & FOPEN_FILE_CREATED) {
+		fuse_dir_changed(dir);
+		file->f_mode |= FMODE_CREATED;
+	}
+	if (!(flags & O_CREAT))
+		fuse_advise_use_readdirplus(dir);
+	if (S_ISDIR(mode))
+                ff->open_flags &= ~FOPEN_DIRECT_IO;
+	err = finish_open(file, entry, generic_file_open);
+	if (err) {
+		fi = get_fuse_inode(inode);
+		fuse_sync_release(fi, ff, flags);
+	} else {
+		file->private_data = ff;
+		fuse_finish_open(inode, file);
+	}
+	kfree(forget);
+	dput(res);
+	return err;
+
+out_free_ff:
+	fuse_file_free(ff);
+out_put_forget_req:
+	kfree(forget);
+out_err:
+	return err;
+
+fallback:
+	return fuse_open_nonatomic(dir, entry, file, flags, mode);
+}
+
+static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
+			    struct file *file, unsigned flags,
+			    umode_t mode)
+{
+	struct fuse_conn *fc = get_fuse_conn(dir);
+
+	if (fc->no_open_atomic)
+		return fuse_open_nonatomic(dir, entry, file, flags, mode);
+	else
+		return fuse_open_atomic(dir, entry, file, flags, mode);
 }
 
 /*
