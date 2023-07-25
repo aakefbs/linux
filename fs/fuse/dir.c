@@ -239,7 +239,7 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		 * fc->no_open_atomic. In case open atomic is not implemented,
 		 * calls fall back to non-atomic open.
 		 */
-		if (!fm->fc->no_open_atomic && flags & LOOKUP_OPEN) {
+		if (fm->fc->has_open_atomic && flags & LOOKUP_OPEN) {
 			spin_lock(&entry->d_lock);
 			entry->d_flags |= DCACHE_ATOMIC_OPEN;
 			spin_unlock(&entry->d_lock);
@@ -925,6 +925,25 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	if (err) {
 		if (err == -ENOSYS) {
 			fc->no_open_atomic = 1;
+
+			/* Might come up if userspace tricks us and would
+			 * return -ENOSYS for OPEN_ATOMIC after it was
+			 * aready working
+			 */
+			if (unlikely(fc->has_open_atomic == 1)) {
+				pr_info("fuse server/daemon bug, atomic open "
+					"got -ENOSYS although it was already "
+					"succeeding before.");
+			}
+
+			/* This should better never happen, revalidate
+			 * is missing for this entry*/
+			if (d_really_is_positive(entry)) {
+				WARN_ON(1);
+				err = -EIO;
+				goto out_free_ff;
+			}
+
 			fuse_file_free(ff);
 			kfree(forget);
 			goto fallback;
@@ -937,6 +956,13 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			}
 			goto out_free_ff;
 		}
+	}
+
+	if (!err && !fc->has_open_atomic) {
+		/* Only set this flag when atomic open did not return an error,
+		 * so that we are absolutely sure it is implemented.
+		 */
+		fc->has_open_atomic = 1;
 	}
 
 	err = -ENOENT;
