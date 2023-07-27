@@ -787,6 +787,12 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
 	struct dentry *res = NULL;
+	unsigned int lookup_flags = 0;
+	unsigned long dir_verifier;
+	bool switched = false;
+
+	/* Expect a negative dentry */
+	BUG_ON(d_inode(dentry));
 
 	/* Userspace expects S_IFREG in create mode */
 	if ((flags & O_CREAT) && (mode & S_IFMT) != S_IFREG) {
@@ -794,6 +800,7 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		err = -EINVAL;
 		goto out_err;
 	}
+
 	forget = fuse_alloc_forget();
 	err = -ENOMEM;
 	if (!forget)
@@ -868,10 +875,45 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		goto out_err;
 	}
 
-	if (d_in_lookup(entry)) {
-		res = d_splice_alias(inode, entry);
-		if (res) {
-			if (IS_ERR(res)) {
+	/* prevent racing/parallel lookup */
+	if (!(open_flags & O_CREAT) && !d_in_lookup(entry)) {
+		DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+		d_drop(entry);
+		switched = true;
+		entry = d_alloc_parallel(entry->d_parent,
+					 &entry->d_name, &wq);
+		if (IS_ERR(entry)) {
+			err = PTR_ERR(entry);
+			goto out_free_ff;
+		}
+
+		if (unlikely(!d_in_lookup(entry))) {
+			err = finish_no_open(file, entry);
+			goto out_free_ff;
+		}
+	}
+
+	/* modified version of _nfs4_open_and_get_state - nfs does not open
+	 * dirs, fuse doe
+	 * nfs has additional d_really_is_negative condition, which does not
+	 * make sense as long as only negative dentries come into this function,
+	 * see BUG_ON above and missing revalidate patch - but needed if
+	 * we are going to handle revalidate
+	 */
+	if (d_really_is_negative(entry)) {
+		struct dentry *alias;
+		d_drop(entry); /* XXX --> is this right and if so, why? */
+		alias = d_exact_alias(entry, inode);
+		if (!alias) {
+			/* XXX Why igrap? */
+
+			/* XXX there is a possible race between d_exact_alias() and
+			 * d_splice_alias() ? Ah, d_splice_alias also searches
+			 * for aliases
+			 */
+
+			alias = d_splice_alias(igrab(inode), entry);
+			if (IS_ERR(alias)) {
 				/*
 				 * Close the file in user space, but do not unlink it,
 				 * if it was created - with network file systems other
@@ -883,10 +925,11 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 				err = PTR_ERR(res);
 				goto out_err;
 			}
-			entry = res;
 		}
-	} else {
-		d_instantiate(entry, inode);
+
+		/* XXX what if !alias? */
+		if (alias)
+			entry = alias;
 	}
 
 	fuse_change_entry_timeout(entry, &outentry);
@@ -914,8 +957,11 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		file->private_data = ff;
 		fuse_finish_open(inode, file);
 	}
+
 	kfree(forget);
 	dput(res);
+	if (switched)
+		d_lookup_done(res);
 	return err;
 
 out_free_ff:
@@ -923,9 +969,12 @@ out_free_ff:
 out_put_forget_req:
 	kfree(forget);
 out_err:
+	if (switched)
+		d_lookup_done(res);
 	return err;
 
 fallback:
+
 	return fuse_create_open(dir, entry, file, flags, mode);
 }
 
