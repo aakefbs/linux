@@ -786,7 +786,14 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	struct fuse_entry_out outentry;
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
-	struct dentry *res = NULL;
+	struct dentry *switched_entry = NULL, *alias = NULL;
+	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+
+	/* Expect a negative dentry */
+	if (unlikely(d_inode(entry))) {
+		WARN_ONCE(1, "unexpected positive dentry in atomic open");
+		goto fallback;
+	}
 
 	/* Userspace expects S_IFREG in create mode */
 	if ((flags & O_CREAT) && (mode & S_IFMT) != S_IFREG) {
@@ -794,6 +801,7 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		err = -EINVAL;
 		goto out_err;
 	}
+
 	forget = fuse_alloc_forget();
 	err = -ENOMEM;
 	if (!forget)
@@ -869,10 +877,39 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		goto out_err;
 	}
 
-	if (d_in_lookup(entry)) {
-		res = d_splice_alias(inode, entry);
-		if (res) {
-			if (IS_ERR(res)) {
+	/* prevent racing/parallel lookup */
+	if (!(flags & O_CREAT) && !d_in_lookup(entry)) {
+		d_drop(entry);
+		switched_entry = d_alloc_parallel(entry->d_parent,
+						   &entry->d_name, &wq);
+		if (IS_ERR(switched_entry)) {
+			err = PTR_ERR(switched_entry);
+			goto out_free_ff;
+		}
+
+		if (unlikely(!d_in_lookup(switched_entry))) {
+			/* fall back */
+			dput(switched_entry);
+			switched_entry = NULL;
+			goto out_free_ff;
+		}
+
+		entry = switched_entry;
+	}
+
+	/* modified version of _nfs4_open_and_get_state - nfs does not open
+	 * dirs, fuse doe
+	 * nfs has additional d_really_is_negative condition, which does not
+	 * make sense as long as only negative dentries come into this function,
+	 * see BUG_ON above and missing revalidate patch - but needed if
+	 * we are going to handle revalidate
+	 */
+	if (d_really_is_negative(entry)) {
+		d_drop(entry);
+		alias = d_exact_alias(entry, inode);
+		if (!alias) {
+			alias = d_splice_alias(inode, entry);
+			if (IS_ERR(alias)) {
 				/*
 				 * Close the file in user space, but do not unlink it,
 				 * if it was created - with network file systems other
@@ -881,17 +918,18 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 				fi = get_fuse_inode(inode);
 				fuse_sync_release(fi, ff, flags);
 				fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
-				err = PTR_ERR(res);
+				err = PTR_ERR(alias);
 				goto out_err;
 			}
-			entry = res;
 		}
-	} else {
-		d_instantiate(entry, inode);
+
+		if (alias)
+			entry = alias;
 	}
 
 	fuse_change_entry_timeout(entry, &outentry);
 
+	/*  File was indeed created */
 	if (outopen.open_flags & FOPEN_FILE_CREATED) {
 		if (!(flags & O_CREAT)) {
 			pr_debug("Server side bug, FOPEN_FILE_CREATED set "
@@ -913,8 +951,16 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		file->private_data = ff;
 		fuse_finish_open(inode, file);
 	}
+
 	kfree(forget);
-	dput(res);
+
+	if (switched_entry) {
+		d_lookup_done(switched_entry);
+		dput(switched_entry);
+	}
+
+	dput(alias);
+
 	return err;
 
 out_free_ff:
@@ -922,7 +968,10 @@ out_free_ff:
 out_put_forget_req:
 	kfree(forget);
 out_err:
-	return err;
+	if (switched_entry) {
+		d_lookup_done(switched_entry);
+		dput(switched_entry);
+	}
 
 fallback:
 	return fuse_create_open(dir, entry, file, flags, mode);
