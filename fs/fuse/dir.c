@@ -259,6 +259,7 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		fm = get_fuse_mount(inode);
 
 		ret = fuse_dentry_do_atomic_revalidate(entry, flags, fm->fc);
+
 		if (ret)
 			goto out;
 
@@ -331,6 +332,12 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 	}
 	ret = 1;
 out:
+	pr_info("%s:%d here lookup-open=%d, atomic-reval=%d, rcu=%d ret=%d\n",
+		__func__, __LINE__,
+		!!(flags & LOOKUP_OPEN),
+		!!(flags & LOOKUP_ATOMIC_REVALIDATE),
+		!!(flags & LOOKUP_RCU), ret);
+
 	return ret;
 
 invalid:
@@ -833,6 +840,9 @@ fuse_atomic_open_revalidate(struct fuse_conn *fc,struct dentry *entry,
 
 	WARN_ON(*alloc_inode != 0);
 
+	pr_info("%s:%d inode-node-id=%llu outentry-nodeid=%llu\n",
+		__func__, __LINE__, get_node_id(inode), outentry->nodeid);
+
 	if (outentry->nodeid != get_node_id(inode) ||
 	    (bool) IS_AUTOMOUNT(inode) !=
 	    (bool) (outentry->attr.flags & FUSE_ATTR_SUBMOUNT)) {
@@ -861,6 +871,8 @@ fuse_atomic_open_revalidate(struct fuse_conn *fc,struct dentry *entry,
 			}
 		}
 
+		pr_info("%s:%d invalidating entry=%p\n", __func__, __LINE__,
+			entry);
 		fuse_invalidate_entry(entry);
 
 		entry = new;
@@ -871,6 +883,24 @@ fuse_atomic_open_revalidate(struct fuse_conn *fc,struct dentry *entry,
 				       entry_attr_timeout(outentry),
 				       attr_version);
 	}
+
+	/* XXX @dharmendra, why unset this flag? If unset would be
+	 * needed, we would have a problem, as there might be races.
+	 * It is also just a feature flag?
+	 */
+#if 0
+
+	/* Unset DCACHE_ATOMIC_OPEN flag from the dentry. In
+	 * fuse_dentry_revalidate(), we set this flag on this dentry to
+	 * avoid lookup. For non-expired dentries we do not enter atomic
+	 * open, and open is done by VFS itself. We come here for expired
+	 * entries(for positive dentries) because such a dentry does lookup
+	 * and it is what we optimized by mentioned flag.
+	 */
+	spin_lock(&entry->d_lock);
+	entry->d_flags &= ~DCACHE_ATOMIC_OPEN;
+	spin_unlock(&entry->d_lock);
+#endif
 
 	return entry;
 }
@@ -900,6 +930,10 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	struct dentry *switched_entry = NULL, *alias = NULL;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
 	int alloc_inode = 0;
+
+	pr_info("%s:%d File name=%s entry@%p d_flags=0x%x Flags=0x%x "
+		"inode@%p", __func__, __LINE__,
+		entry->d_name.name, entry, entry->d_flags, flags, inode);
 
 	/* Userspace expects S_IFREG in create mode */
 	if ((flags & O_CREAT) && (mode & S_IFMT) != S_IFREG) {
@@ -989,6 +1023,8 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		}
 	}
 
+	pr_info("err=%d fc->has_open_atomic=%d\n", err, fc->has_open_atomic);
+
 	if (!err && !fc->has_open_atomic) {
 		/* Only set this flag when atomic open did not return an error,
 		 * so that we are absolutely sure it is implemented.
@@ -1006,6 +1042,8 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 
 	/* prevent racing/parallel lookup */
 	if (!(flags & O_CREAT) && !d_in_lookup(entry)) {
+		pr_info("%s:%d alloc new dentry\n", __func__, __LINE__);
+
 		d_drop(entry);
 		switched_entry = d_alloc_parallel(entry->d_parent,
 						   &entry->d_name, &wq);
@@ -1014,7 +1052,12 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			goto out_free_ff;
 		}
 
+		pr_info("%s:%d old-dentry=%p switched=%p\n", __func__, __LINE__,
+			entry, switched_entry);
+
 		if (unlikely(!d_in_lookup(switched_entry))) {
+			pr_info("%s:%d %p not in lookup\n",
+				__func__, __LINE__, switched_entry);
 			/* fall back */
 			dput(switched_entry);
 			switched_entry = NULL;
@@ -1033,9 +1076,14 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		if (IS_ERR(new))
 			goto out_free_ff;
 
-		if (new != entry && new != NULL)
+		if (new != entry && new != NULL) {
+			pr_info("New dentry after revalidate old=%p new=%p\n",
+				entry, new);
 			switched_entry = new;
+		}
 	}
+
+	pr_info("%s:%d alloc_inode=%d", __func__, __LINE__, alloc_inode);
 
 	if (switched_entry)
 		entry = switched_entry;
@@ -1066,7 +1114,12 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	if (d_really_is_negative(entry)) {
 		d_drop(entry);
 		alias = d_exact_alias(entry, inode);
+
+		pr_info("%s:%d entry=%p alias=%p switched=%p\n",
+			__func__, __LINE__, entry, alias, switched_entry);
+
 		if (!alias) {
+			pr_info("%s:%d !alias\n", __func__, __LINE__);
 			alias = d_splice_alias(inode, entry);
 			if (IS_ERR(alias)) {
 				/*
@@ -1082,10 +1135,15 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			}
 		}
 
+		pr_info("%s:%d entry=%p alias=%p switched=%p\n",
+			__func__, __LINE__, entry, alias, switched_entry);
+
 		if (alias)
 			entry = alias;
 	}
 
+	pr_info("%s:%d setting entry timeout %llus:%us\n", __func__, __LINE__,
+		outentry.entry_valid, outentry.entry_valid_nsec);
 	fuse_change_entry_timeout(entry, &outentry);
 
 	/*  File was indeed created */
@@ -1111,13 +1169,24 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		fuse_finish_open(inode, file);
 	}
 
+	pr_info("%s:%d Fname=%s entry@%p "
+		"d_fl=0x%x fl=0x%x alloc_i=%d err=%d",
+		__func__, __LINE__,
+		entry->d_name.name, entry, entry->d_flags, flags,
+		alloc_inode, err);
+
 	kfree(forget);
 
 	if (switched_entry) {
+		pr_info("%s:%d dput-switched=%p in-lookup=%d\n",
+			__func__, __LINE__, switched_entry,
+			d_in_lookup(switched_entry));
 		d_lookup_done(switched_entry);
 		dput(switched_entry);
 	}
 
+	pr_info("%s:%d dput-alias=%p\n",
+		__func__, __LINE__, alias);
 	dput(alias);
 
 	return err;
@@ -1128,6 +1197,8 @@ out_put_forget_req:
 	kfree(forget);
 out_err:
 	if (switched_entry) {
+		pr_info("%s:%d dput-entry=%p\n",
+			__func__, __LINE__, switched_entry);
 		d_lookup_done(switched_entry);
 		dput(switched_entry);
 	}
