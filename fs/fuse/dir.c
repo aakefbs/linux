@@ -854,11 +854,8 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		kfree(forget);
 		goto fallback;
 	}
-	if (err) {
-		if (err == -ENOENT)
-			fuse_invalidate_entry_cache(entry);
+	if (err)
 		goto out_free_ff;
-	}
 
 	err = -EIO;
 	if (invalid_nodeid(outentry.nodeid) || fuse_invalid_attr(&outentry.attr))
