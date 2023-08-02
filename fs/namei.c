@@ -1660,6 +1660,8 @@ static struct dentry *lookup_fast(struct nameidata *nd)
 	}
 
 	if (unlikely(d_atomic_open(dentry))) {
+		pr_info("%s:%d dentry=%p has atomic-open\n",
+			__func__, __LINE__, dentry);
 		dput(dentry);
 		return NULL;
 	}
@@ -3402,7 +3404,7 @@ static struct dentry *atomic_open(struct nameidata *nd, struct dentry *dentry,
  *
  * An error code is returned on failure.
  */
-static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
+struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 				  const struct open_flags *op,
 				  bool got_write)
 {
@@ -3414,6 +3416,7 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 	int error, create_error = 0;
 	umode_t mode = op->mode;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+	bool debug = false;
 
 	if (unlikely(IS_DEADDIR(dir_inode)))
 		return ERR_PTR(-ENOENT);
@@ -3444,6 +3447,11 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 		return dentry;
 	}
 
+	if (d_atomic_open(dentry)) {
+		debug = true;
+		pr_info("Atomic open for dentry=%p\n", dentry);
+	}
+
 	/*
 	 * Checking write permission is tricky, bacuse we don't know if we are
 	 * going to actually need it: O_CREAT opens should work as long as the
@@ -3468,6 +3476,11 @@ static struct dentry *lookup_open(struct nameidata *nd, struct file *file,
 	}
 	if (create_error)
 		open_flag &= ~O_CREAT;
+
+	if (debug)
+		pr_info("dir_inode->i_op->atomic_open=%p\n",
+			dir_inode->i_op->atomic_open);
+
 	if (dir_inode->i_op->atomic_open) {
 		dentry = atomic_open(nd, dentry, file, open_flag, mode);
 		if (unlikely(create_error) && dentry == ERR_PTR(-ENOENT))
