@@ -304,6 +304,17 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 	} else if (inode) {
 		fi = get_fuse_inode(inode);
 		if (flags & LOOKUP_RCU) {
+
+			fm = get_fuse_mount(inode);
+			if (fm->fc->has_open_atomic) {
+				/* Atomic open is preferred, as it does entry revalidate and
+				 * attribute refresh, but DCACHE_ATOMIC_OPEN cannot be set
+				 * in RCU mode
+				 */
+				if (flags & LOOKUP_OPEN)
+					return -ECHILD;
+			}
+
 			if (test_bit(FUSE_I_INIT_RDPLUS, &fi->state))
 				return -ECHILD;
 		} else if (test_and_clear_bit(FUSE_I_INIT_RDPLUS, &fi->state)) {
@@ -951,11 +962,10 @@ static int _fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			 * return -ENOSYS for OPEN_ATOMIC after it was
 			 * aready working
 			 */
-			if (unlikely(fc->has_open_atomic == 1)) {
+			if (unlikely(fc->has_open_atomic == 1))
 				pr_info("fuse server/daemon bug, atomic open "
 					"got -ENOSYS although it was already "
 					"succeeding before.");
-			}
 
 			/* This should better never happen, revalidate
 			 * is missing for this entry*/
