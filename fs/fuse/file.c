@@ -1083,6 +1083,12 @@ static unsigned int fuse_write_flags(struct kiocb *iocb)
 	if (iocb->ki_flags & IOCB_SYNC)
 		flags |= O_SYNC;
 
+	/*
+	 * Note: If O_DIRECT should be ever added here,
+	 *       iocb->ki_flags & IOCB_DIRECT cannot be trusted when
+	 *       FOPEN_DIRECT_IO is set.
+	 */
+
 	return flags;
 }
 
@@ -1693,29 +1699,6 @@ static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	return res;
 }
 
-static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
-{
-	struct inode *inode = file_inode(iocb->ki_filp);
-	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
-	ssize_t res;
-	bool exclusive = false;
-
-	fuse_dio_lock(iocb, from, &exclusive);
-	res = generic_write_checks(iocb, from);
-	if (res > 0) {
-		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
-			res = fuse_direct_IO(iocb, from);
-		} else {
-			res = fuse_send_dio(&io, from, &iocb->ki_pos,
-					    FUSE_DIO_WRITE);
-			fuse_write_update_attr(inode, iocb->ki_pos, res);
-		}
-	}
-	fuse_dio_unlock(inode, exclusive);
-
-	return res;
-}
-
 static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
@@ -1746,10 +1729,10 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (FUSE_IS_DAX(inode))
 		return fuse_dax_write_iter(iocb, from);
 
-	if (!(ff->open_flags & FOPEN_DIRECT_IO))
-		return fuse_cache_write_iter(iocb, from);
-	else
-		return fuse_direct_write_iter(iocb, from);
+	if (ff->open_flags & FOPEN_DIRECT_IO)
+		iocb->ki_flags |= IOCB_DIRECT;
+
+	return fuse_cache_write_iter(iocb, from);
 }
 
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
