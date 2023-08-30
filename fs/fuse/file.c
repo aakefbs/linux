@@ -1414,7 +1414,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = mapping->host;
 	ssize_t err;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	bool exclusive = true;
+	bool exclusive = false;
+	int remove_privs;
 
 	if (fc->writeback_cache && !(iocb->ki_flags & IOCB_DIRECT)) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1440,9 +1441,23 @@ relock:
 	if (err <= 0)
 		goto out;
 
-	err = file_remove_privs(file);
-	if (err)
-		goto out;
+	if (!exclusive) {
+		remove_privs = file_needs_remove_privs(file);
+		if (remove_privs) {
+			fuse_dio_unlock(inode, exclusive);
+			exclusive = true;
+			goto relock;
+		}
+	} else {
+		remove_privs = 1;
+	}
+
+	if (remove_privs) {
+		/* needs the exclusive lock */
+		err = file_remove_privs(file);
+		if (err)
+			goto out;
+	}
 
 	err = file_update_time(file);
 	if (err)
