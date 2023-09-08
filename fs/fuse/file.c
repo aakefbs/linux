@@ -1415,13 +1415,15 @@ static void fuse_dio_unlock(struct inode *inode, bool exclusive)
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
+	struct fuse_file *ff = file->private_data;
 	struct address_space *mapping = file->f_mapping;
 	ssize_t written = 0;
 	struct inode *inode = mapping->host;
 	ssize_t err;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool exclusive = false;
-	int remove_privs;
+	bool fopen_dio = !!(ff->open_flags & FOPEN_DIRECT_IO);
+	int remove_privs = 0;
 
 	if (fc->writeback_cache && !(iocb->ki_flags & IOCB_DIRECT)) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1447,7 +1449,8 @@ relock:
 	if (err <= 0)
 		goto out;
 
-	if (!exclusive) {
+	/* traditionally FOPEN_DIRECT_IO does not do remove privileges */
+	if (!fopen_dio && !exclusive) {
 		remove_privs = file_needs_remove_privs(file);
 		if (remove_privs) {
 			fuse_dio_unlock(inode, exclusive);
