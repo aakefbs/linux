@@ -326,11 +326,7 @@ void fuse_request_end(struct fuse_req *req)
 		spin_unlock(&fc->bg_lock);
 	} else {
 		/* Wake up waiter sleeping in request_wait_answer() */
-		if (fc->ring.ready) {
-			/* actually we would like to have wake_same_core */
-			wake_up_sync(&req->waitq);
-		} else
-			wake_up(&req->waitq);
+		wake_up(&req->waitq);
 	}
 
 	if (test_bit(FR_ASYNC, &req->flags))
@@ -375,13 +371,14 @@ static void request_wait_answer(struct fuse_req *req)
 	struct fuse_conn *fc = req->fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
 	int err;
+	int prev_cpu = task_cpu(current);
 
 	if (!fc->no_interrupt) {
 		/* Any signal may interrupt this */
 		err = wait_event_interruptible(req->waitq,
 					test_bit(FR_FINISHED, &req->flags));
 		if (!err)
-			return;
+			goto out;
 
 		set_bit(FR_INTERRUPTED, &req->flags);
 		/* matches barrier in fuse_dev_do_read() */
@@ -395,7 +392,7 @@ static void request_wait_answer(struct fuse_req *req)
 		err = wait_event_killable(req->waitq,
 					test_bit(FR_FINISHED, &req->flags));
 		if (!err)
-			return;
+			goto out;
 
 		spin_lock(&fiq->lock);
 		/* Request is not yet in userspace, bail out */
@@ -404,7 +401,7 @@ static void request_wait_answer(struct fuse_req *req)
 			spin_unlock(&fiq->lock);
 			__fuse_put_request(req);
 			req->out.h.error = -EINTR;
-			return;
+			goto out;
 		}
 		spin_unlock(&fiq->lock);
 	}
@@ -414,6 +411,10 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Wait it out.
 	 */
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
+out:
+	if (prev_cpu != task_cpu(current))
+		pr_info("%s cpu switch from=%d to=%d\n",
+			__func__, prev_cpu, task_cpu(current));
 }
 
 static void __fuse_request_send(struct fuse_req *req)
