@@ -1243,8 +1243,7 @@ err:
  */
 int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 {
-	const struct fuse_uring_cmd_req *cmd_req =
-		(struct fuse_uring_cmd_req *)cmd->cmd;
+	const struct fuse_uring_cmd_req *cmd_req =  io_uring_sqe_cmd(cmd->sqe);
 	struct fuse_dev *fud = fuse_get_dev(cmd->file);
 	struct fuse_conn *fc = fud->fc;
 	struct fuse_ring_queue *queue;
