@@ -2247,6 +2247,9 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->bg_lock);
 
 		fuse_set_initialized(fc);
+
+		WRITE_ONCE(fc->ring.stop_requested, 1);
+
 		list_for_each_entry(fud, &fc->devices, entry) {
 			struct fuse_pqueue *fpq = &fud->pq;
 
@@ -2290,12 +2293,10 @@ void fuse_abort_conn(struct fuse_conn *fc)
 
 		fuse_dev_end_requests(&to_end);
 
-		mutex_lock(&fc->ring.start_stop_lock);
 		if (fc->ring.configured && !fc->ring.queues_stopped) {
 			fuse_uring_end_requests(fc);
-			schedule_delayed_work(&fc->ring.stop_monitor, 0);
+			fuse_uring_stop_queues(fc);
 		}
-		mutex_unlock(&fc->ring.start_stop_lock);
 
 	} else {
 		spin_unlock(&fc->lock);
@@ -2311,10 +2312,8 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 
 	/* XXX use struct completion? */
-	if (fc->ring.daemon != NULL) {
-		schedule_delayed_work(&fc->ring.stop_monitor, 0);
+	if (fc->ring.nr_queues)
 		wait_event(fc->ring.stop_waitq, fc->ring.queues_stopped == 1);
-	}
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
