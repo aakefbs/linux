@@ -679,7 +679,7 @@ struct fuse_ring {
 	size_t queue_buf_size;
 
 	/* When zero the queue can be freed on destruction */
-	int queue_refs;
+	atomic_t queue_refs;
 
 	/* Hold ring requests */
 	struct fuse_ring_queue *queues;
@@ -693,34 +693,21 @@ struct fuse_ring {
 	/* one queue per core or a single queue only ? */
 	unsigned int per_core_queue:1;
 
-	/* userspace sent a stop ioctl */
-	unsigned int stop_requested:1;
-
 	/* Is the ring completely iocl configured */
 	unsigned int configured:1;
 
 	/* Is the ring read to take requests */
 	unsigned int ready:1;
 
-	/* used on shutdown */
-	unsigned int queues_stopped:1;
+	/* userspace sent a stop ioctl */
+	unsigned int stop_requested;
 
-	/* userspace process */
-	struct task_struct *daemon;
+	/* used on shutdown */
+	unsigned int queues_stopped;
 
 	struct mutex start_stop_lock;
 
-	/* userspace has a special thread that exists only to wait
-	 * in the kernel for process stop, to release uring
-	 */
 	wait_queue_head_t stop_waitq;
-
-	/* The daemon might get killed and uring then needs
-	 * to be released without getting a umount notification, this
-	 * workqueue exists to release uring even without a process
-	 * being hold in the stop_waitq
-	 */
-	struct delayed_work stop_monitor;
 };
 
 /**

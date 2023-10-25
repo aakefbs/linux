@@ -927,7 +927,6 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 
 	init_waitqueue_head(&fc->ring.stop_waitq);
 	mutex_init(&fc->ring.start_stop_lock);
-	fc->ring.daemon = NULL;
 
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);
@@ -1890,7 +1889,7 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 		mutex_unlock(&fuse_mutex);
 	}
 
-	if (fc->ring.daemon != NULL)
+	if (fc->ring.nr_queues)
 		fuse_uring_ring_destruct(fc);
 
 	mutex_destroy(&fc->ring.start_stop_lock);

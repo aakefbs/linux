@@ -1056,19 +1056,6 @@ enum fuse_uring_ioctl_cmd {
 
 	/* The ioctl is a queue configuration command */
 	FUSE_URING_IOCTL_CMD_QUEUE_CFG = 1,
-
-	/* Wait in the kernel until the process gets terminated, process
-	 * termination will wake up the waitq and initiate ring shutdown.
-	 * This avoids the need to run a check in intervals if ring termination
-	 * should be started (less cpu cycles) and also helps for faster ring
-	 * shutdown.
-	 */
-	FUSE_URING_IOCTL_CMD_WAIT      = 2,
-
-	/* Daemon side wants to explicitly stop the waiter thread. This will
-	 * restart the interval termination checker.
-	 */
-	FUSE_URING_IOCTL_CMD_STOP      = 3,
 };
 
 struct fuse_uring_cfg {
