@@ -1751,6 +1751,7 @@ void fuse_set_nowrite(struct inode *inode)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
 	BUG_ON(!inode_is_locked(inode));
+	lockdep_assert_held_write(&inode->i_rwsem);
 
 	spin_lock(&fi->lock);
 	BUG_ON(fi->writectr < 0);
