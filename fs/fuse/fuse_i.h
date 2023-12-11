@@ -111,7 +111,7 @@ struct fuse_inode {
 	u64 attr_version;
 
 	union {
-		/* Write related fields (regular file only) */
+		/* read/write io cache (regular file only) */
 		struct {
 			/* Files usable in writepage.  Protected by fi->lock */
 			struct list_head write_files;
@@ -123,8 +123,14 @@ struct fuse_inode {
 			 * (FUSE_NOWRITE) means more writes are blocked */
 			int writectr;
 
+			/** Number of files/maps using page cache */
+			int iocachectr;
+
 			/* Waitq for writepage completion */
 			wait_queue_head_t page_waitq;
+
+			/* waitq for direct-io completion */
+			wait_queue_head_t direct_io_waitq;
 
 			/* List of writepage requestst (pending or sent) */
 			struct rb_root writepages;
@@ -187,6 +193,8 @@ enum {
 	FUSE_I_BAD,
 	/* Has btime */
 	FUSE_I_BTIME,
+	/* Wants or already has page cache IO */
+	FUSE_I_CACHE_IO_MODE,
 };
 
 struct fuse_conn;
@@ -1349,6 +1357,72 @@ int fuse_fileattr_set(struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct fileattr *fa);
 
 /* file.c */
+/*
+ * Request an open in caching mode.
+ * Return true if in caching mode.
+ */
+static inline bool fuse_inode_get_io_cache(struct fuse_inode *fi)
+{
+	assert_spin_locked(&fi->lock);
+	if (fi->iocachectr < 0)
+		return false;
+	fi->iocachectr++;
+	if (fi->iocachectr == 1)
+		set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+
+	return true;
+}
+
+/*
+ * Release an open in caching mode.
+ * Return true if no more files open in caching mode.
+ */
+static inline bool fuse_inode_put_io_cache(struct fuse_inode *fi)
+{
+	assert_spin_locked(&fi->lock);
+	if (WARN_ON(fi->iocachectr <= 0))
+		return false;
+
+	if (--fi->iocachectr == 0) {
+		clear_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Requets to deny new opens in caching mode.
+ * Return true if denying new opens in caching mode.
+ */
+static inline bool fuse_inode_deny_io_cache(struct fuse_inode *fi)
+{
+	assert_spin_locked(&fi->lock);
+	if (fi->iocachectr > 0)
+		return false;
+	fi->iocachectr--;
+	return true;
+}
+
+/*
+ * Release a request to deny open in caching mode.
+ * Return true if allowing new opens in caching mode.
+ */
+static inline bool fuse_inode_allow_io_cache(struct fuse_inode *fi)
+{
+	assert_spin_locked(&fi->lock);
+	if (WARN_ON(fi->iocachectr >= 0))
+		return false;
+	return ++(fi->iocachectr) == 0;
+}
+
+/*
+ * Return true if allowing new opens in caching mode.
+ */
+static inline bool fuse_is_io_cache_allowed(struct fuse_inode *fi)
+{
+	return READ_ONCE(fi->iocachectr) >= 0;
+}
 
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 				 unsigned int open_flags, bool isdir);
