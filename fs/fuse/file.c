@@ -2470,12 +2470,15 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 		/* Can't provide the coherency needed for MAP_SHARED
 		 * if FUSE_DIRECT_IO_ALLOW_MMAP isn't set.
 		 */
-		if ((vma->vm_flags & VM_MAYSHARE) && !fc->direct_io_allow_mmap)
-			return -ENODEV;
+		if (vma->vm_flags & VM_MAYSHARE) {
+			if (!fc->direct_io_allow_mmap)
+				return -ENODEV;
+		} else {
+			/* MAP_PRIVATE */
+			invalidate_inode_pages2(file->f_mapping);
 
-		invalidate_inode_pages2(file->f_mapping);
-
-		return generic_file_mmap(file, vma);
+			return generic_file_mmap(file, vma);
+		}
 	}
 
 	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
