@@ -1358,12 +1358,19 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
 	return false;
 }
 
+/*
+ *@exclusive is an in-out parameter. If set to true, the caller requests an
+ *           eclusive lock, if set to false a test is done if an exclusive
+ *           lock is needed.
+ */
 static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
 			  bool *exclusive)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 
-	*exclusive = fuse_dio_wr_exclusive_lock(iocb, from);
+	if (!(*exclusive))
+		*exclusive = fuse_dio_wr_exclusive_lock(iocb, from);
+
 	if (*exclusive) {
 		inode_lock(inode);
 	} else {
@@ -1659,7 +1666,7 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 	ssize_t res;
-	bool exclusive;
+	bool exclusive = false;
 
 	fuse_dio_lock(iocb, from, &exclusive);
 	res = generic_write_checks(iocb, from);
