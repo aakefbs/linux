@@ -27,6 +27,11 @@
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
+static bool __read_mostly enable_uring;
+module_param(enable_uring, bool, 0644);
+MODULE_PARM_DESC(enable_uring,
+	"Enable uring userspace communication through uring.");
+
 static struct kmem_cache *fuse_req_cachep;
 
 static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
@@ -2431,15 +2436,11 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	return 0;
 }
 
-static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
+static long _fuse_dev_ioctl_clone(struct file *file, int oldfd)
 {
 	int res;
-	int oldfd;
 	struct fuse_dev *fud = NULL;
 	struct fd f;
-
-	if (get_user(oldfd, argp))
-		return -EFAULT;
 
 	f = fdget(oldfd);
 	if (!f.file)
@@ -2461,6 +2462,16 @@ static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
 
 	fdput(f);
 	return res;
+}
+
+static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
+{
+	int oldfd;
+
+	if (get_user(oldfd, argp))
+		return -EFAULT;
+
+	return _fuse_dev_ioctl_clone(file, oldfd);
 }
 
 static long fuse_dev_ioctl_backing_open(struct file *file,
@@ -2501,10 +2512,14 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
 static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 {
 	int res;
-	struct fuse_uring_cfg ring_conf;
+	struct fuse_uring_cfg cfg;
 	struct fuse_dev *fud;
+	struct fuse_conn *fc;
 
-	res = copy_from_user(&ring_conf, (void *)argp, sizeof(ring_conf));
+	if (!enable_uring)
+		return -ENOTTY;
+
+	res = copy_from_user(&cfg, (void *)argp, sizeof(cfg));
 	if (res != 0)
 		return -EFAULT;
 
@@ -2512,7 +2527,19 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 	if (!fud)
 		return -EPERM;
 
-	return _fuse_uring_ioctl(file, &ring_conf);
+	res = _fuse_dev_ioctl_clone(file, cfg.control_fd);
+	if (res != 0)
+		return res;
+	fc = fud->fc;
+
+	pr_debug("%s fc=%p flags=%x cmd=%d qid=%d nq=%d fg=%d async=%d\n",
+		 __func__, fc, cfg.flags, cfg.cmd, cfg.qid, cfg.nr_queues,
+		 cfg.fg_queue_depth, cfg.async_queue_depth);
+
+	if (cfg.cmd != FUSE_URING_IOCTL_CMD_QUEUE_CFG)
+		return -EINVAL;
+
+	return fuse_uring_configure(fc, cfg.qid, &cfg);
 }
 
 static long
