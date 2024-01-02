@@ -2373,6 +2373,32 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	return 0;
 }
 
+static int fuse_dev_ioctl_clone(struct file *file, int oldfd)
+{
+	struct fd f;
+
+	f = fdget(oldfd);
+	if (!f.file)
+		return -EINVAL;
+
+	/*
+	 * Check against file->f_op because CUSE
+	 * uses the same ioctl handler.
+	 */
+	if (f.file->f_op == file->f_op)
+		fud = fuse_get_dev(f.file);
+
+	res = -EINVAL;
+	if (fud) {
+		mutex_lock(&fuse_mutex);
+		res = fuse_device_clone(fud->fc, file);
+		mutex_unlock(&fuse_mutex);
+	}
+	fdput(f);
+
+	return res;
+}
+
 static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
 {
@@ -2387,24 +2413,7 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 		if (get_user(oldfd, (__u32 __user *)arg))
 			return -EFAULT;
 
-		f = fdget(oldfd);
-		if (!f.file)
-			return -EINVAL;
-
-		/*
-		 * Check against file->f_op because CUSE
-		 * uses the same ioctl handler.
-		 */
-		if (f.file->f_op == file->f_op)
-			fud = fuse_get_dev(f.file);
-
-		res = -EINVAL;
-		if (fud) {
-			mutex_lock(&fuse_mutex);
-			res = fuse_device_clone(fud->fc, file);
-			mutex_unlock(&fuse_mutex);
-		}
-		fdput(f);
+		res = fuse_dev_ioctl_clone(file, oldfd);
 		break;
 	case FUSE_DEV_IOC_URING:
 		/* XXX fud ensures fc->ring.start_stop_lock is initialized? */
