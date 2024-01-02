@@ -30,11 +30,6 @@
 /* default monitor interval for a dying daemon */
 #define FURING_DAEMON_MON_PERIOD (5 * HZ)
 
-static bool __read_mostly enable_uring;
-module_param(enable_uring, bool, 0644);
-MODULE_PARM_DESC(enable_uring,
-	"Enable uring userspace communication through uring.");
-
 static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent,
 					     unsigned int issue_flags);
 static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
@@ -906,8 +901,8 @@ __must_hold(fc->ring.stop_waitq.lock)
  * Configure the queue for t he given qid. First call will also initialize
  * the ring for this connection.
  */
-static int fuse_uring_cfg(struct fuse_conn *fc, unsigned int qid,
-			  struct fuse_uring_cfg *cfg)
+int fuse_uring_configure(struct fuse_conn *fc, unsigned int qid,
+			 struct fuse_uring_cfg *cfg)
 {
 	int rc;
 
@@ -934,35 +929,6 @@ unlock:
 	mutex_unlock(&fc->ring.start_stop_lock);
 
 	return rc;
-}
-
-int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
-{
-	struct fuse_dev *fud = fuse_get_dev(file);
-	struct fuse_conn *fc;
-
-	if (fud == NULL)
-		return -ENODEV;
-
-	if (!enable_uring)
-		return -ENOTTY;
-
-	fc = fud->fc;
-
-	pr_devel("%s fc=%p flags=%x cmd=%d qid=%d nq=%d fg=%d async=%d\n",
-		 __func__, fc, cfg->flags, cfg->cmd, cfg->qid, cfg->nr_queues,
-		 cfg->fg_queue_depth, cfg->async_queue_depth);
-
-
-	switch (cfg->cmd) {
-	case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
-		return fuse_uring_cfg(fc, cfg->qid, cfg);
-	default:
-		return -EINVAL;
-	}
-
-	/* no cmd flag set */
-	return -EINVAL;
 }
 
 void fuse_uring_ring_destruct(struct fuse_conn *fc)
