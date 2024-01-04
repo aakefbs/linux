@@ -709,7 +709,6 @@ __must_hold(&queue->lock)
  *  Stop the ring queues
  */
 void fuse_uring_stop_queues(struct fuse_conn *fc)
-__must_hold(fc->ring.start_stop_lock)
 {
 	int qid;
 
@@ -722,9 +721,7 @@ __must_hold(fc->ring.start_stop_lock)
 		if (!queue->configured)
 			continue;
 
-		spin_lock(&queue->lock);
 		fuse_uring_stop_queue(queue);
-		spin_unlock(&queue->lock);
 	}
 }
 
@@ -798,6 +795,7 @@ __must_hold(fc->ring.stop_waitq.lock)
 		return -EINVAL;
 	}
 
+	fc->ring.queues_stopped = true;
 	fc->ring.nr_queues = cfg->nr_queues;
 	fc->ring.per_core_queue = cfg->nr_queues > 1;
 
@@ -1073,6 +1071,7 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 
 	if (nr_queue_init == fc->ring.nr_queues) {
 		fuse_uring_conn_cfg_limits(fc);
+		WRITE_ONCE(fc->ring.queues_stopped, false);
 		fc->ring.ready = 1;
 	}
 

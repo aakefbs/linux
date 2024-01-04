@@ -2318,7 +2318,8 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 
 	/* XXX use struct completion? */
 	if (fc->ring.nr_queues)
-		wait_event(fc->ring.stop_waitq, fc->ring.queues_stopped == 1);
+		wait_event(fc->ring.stop_waitq,
+			   READ_ONCE(fc->ring.queues_stopped) == true);
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
@@ -2330,6 +2331,7 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		struct fuse_pqueue *fpq = &fud->pq;
 		LIST_HEAD(to_end);
 		unsigned int i;
+		int dev_cnt;
 
 		spin_lock(&fpq->lock);
 		WARN_ON(!list_empty(&fpq->io));
@@ -2339,8 +2341,15 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 
 		fuse_dev_end_requests(&to_end);
 
-		/* Are we the last open device? */
-		if (atomic_dec_and_test(&fc->dev_count)) {
+		/*
+		 * Are we the last open device?
+		 * Or is this with io_uring and only ring devices left?
+		 * These devices will not receive a ->release() as long as
+		 * commands are not completed with io_uring_cmd_done
+		 */
+		dev_cnt = atomic_dec_return(&fc->dev_count);
+		if (dev_cnt == 0 ||
+		   (fc->ring.ready && dev_cnt == fc->ring.nr_queues)) {
 			WARN_ON(fc->iq.fasync != NULL);
 			fuse_abort_conn(fc);
 		}
