@@ -2415,42 +2415,58 @@ static int fuse_dev_ioctl_clone(struct file *file, int oldfd)
 	return res;
 }
 
-static int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
+/**
+ * Configure the queue for t he given qid. First call will also initialize
+ * the ring for this connection.
+ */
+static int fuse_dev_uring_ioctl(struct file *file, unsigned long arg)
 {
 	struct fuse_dev *fud;
 	struct fuse_conn *fc;
 	int res;
+	struct fuse_uring_cfg cfg;
 
-	if (!enable_uring)
-		return -ENOTTY;
-
-	res = fuse_dev_ioctl_clone(file, cfg->control_fd);
+	res = copy_from_user(&cfg, (void *)arg, sizeof(cfg));
 	if (res != 0)
-		return res;
+		return -EFAULT;
+
+	if (cfg.cmd == FUSE_URING_IOCTL_CMD_QUEUE_CFG) {
+		res = fuse_dev_ioctl_clone(file, cfg.qconf.control_fd);
+		if (res != 0)
+			return res;
+	}
 
 	fud = fuse_get_dev(file);
 	if (fud == NULL)
 		return -ENODEV;
 	fc = fud->fc;
 
-	pr_devel("%s fc=%p flags=%x cmd=%d qid=%d nq=%d fg=%d async=%d\n",
-		 __func__, fc, cfg->flags, cfg->cmd, cfg->qid, cfg->nr_queues,
-		 cfg->fg_queue_depth, cfg->async_queue_depth);
+	switch (cfg.cmd) {
+		case FUSE_URING_IOCTL_CMD_RING_CFG:
+			mutex_lock(&fc->ring.start_stop_lock);
+			res = fuse_uring_conn_cfg(fc, &cfg.rconf);
+			mutex_unlock(&fc->ring.start_stop_lock);
 
-	if (cfg->cmd != FUSE_URING_IOCTL_CMD_QUEUE_CFG)
-		return -EINVAL;
+			if (res != 0)
+				return res;
+			break;
 
+		case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
+			res = fuse_uring_queue_cfg(fc, &cfg.qconf);
+			break;
 
-	return fuse_uring_configure(fc, cfg->qid, cfg);
+		default:
+			res = -EINVAL;
+	}
+
+	return res;
 }
-
 
 static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
 {
-	int res;
 	int oldfd;
-	struct fuse_uring_cfg ring_conf;
+	int res;
 
 	switch (cmd) {
 	case FUSE_DEV_IOC_CLONE:
@@ -2460,18 +2476,15 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 		res = fuse_dev_ioctl_clone(file, oldfd);
 		break;
 	case FUSE_DEV_IOC_URING:
-		res = copy_from_user(&ring_conf, (void *)arg,
-				     sizeof(ring_conf));
-		if (res == 0)
-			res = fuse_uring_ioctl(file, &ring_conf);
-		else
-			res = -EFAULT;
+		if (!enable_uring)
+			return -ENOTTY;
 
-		break;
+		return fuse_dev_uring_ioctl(file, arg);
 	default:
 		res = -ENOTTY;
 		break;
 	}
+
 	return res;
 }
 

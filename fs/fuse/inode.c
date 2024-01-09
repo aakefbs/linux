@@ -927,6 +927,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 
 	init_waitqueue_head(&fc->ring.stop_waitq);
 	mutex_init(&fc->ring.start_stop_lock);
+	fc->ring.mem_buf_map = RB_ROOT;
 
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);

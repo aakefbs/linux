@@ -699,15 +699,23 @@ struct fuse_ring {
 	/* Is the ring read to take requests */
 	unsigned int ready:1;
 
+	/* numa aware memory allocation */
+	unsigned int numa_aware:1;
+
 	/* userspace sent a stop ioctl */
 	unsigned int stop_requested;
 
 	/* used on shutdown */
-	unsigned int queues_stopped;
+	bool queues_stopped;
 
 	struct mutex start_stop_lock;
 
 	wait_queue_head_t stop_waitq;
+
+	/* mmaped ring entry memory buffers, mmaped values is the key,
+	 * kernel pointer is the value
+	 */
+	struct rb_root mem_buf_map;
 };
 
 /**
