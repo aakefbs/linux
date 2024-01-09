@@ -2518,6 +2518,10 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
 	return fuse_backing_close(fud->fc, backing_id);
 }
 
+/**
+ * Configure the queue for t he given qid. First call will also initialize
+ * the ring for this connection.
+ */
 static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 {
 	int res;
@@ -2525,30 +2529,37 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 	struct fuse_dev *fud;
 	struct fuse_conn *fc;
 
-	if (!enable_uring)
-		return -ENOTTY;
-
 	res = copy_from_user(&cfg, (void *)argp, sizeof(cfg));
 	if (res != 0)
 		return -EFAULT;
 
-	fud = fuse_get_dev(file);
-	if (!fud)
-		return -EPERM;
+	if (cfg.cmd == FUSE_URING_IOCTL_CMD_QUEUE_CFG) {
+		res = _fuse_dev_ioctl_clone(file, cfg.qconf.control_fd);
+		if (res != 0)
+			return res;
+	}
 
-	res = _fuse_dev_ioctl_clone(file, cfg.control_fd);
-	if (res != 0)
-		return res;
+	fud = fuse_get_dev(file);
+	if (fud == NULL)
+		return -ENODEV;
 	fc = fud->fc;
 
-	pr_debug("%s fc=%p flags=%x cmd=%d qid=%d nq=%d fg=%d async=%d\n",
-		 __func__, fc, cfg.flags, cfg.cmd, cfg.qid, cfg.nr_queues,
-		 cfg.fg_queue_depth, cfg.async_queue_depth);
+	switch (cfg.cmd) {
+		case FUSE_URING_IOCTL_CMD_RING_CFG:
+			mutex_lock(&fc->ring.start_stop_lock);
+			res = fuse_uring_conn_cfg(fc, &cfg.rconf);
+			mutex_unlock(&fc->ring.start_stop_lock);
 
-	if (cfg.cmd != FUSE_URING_IOCTL_CMD_QUEUE_CFG)
-		return -EINVAL;
+			if (res != 0)
+				return res;
+			break;
 
-	return fuse_uring_configure(fc, cfg.qid, &cfg);
+		case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
+			res = fuse_uring_queue_cfg(fc, &cfg.qconf);
+			break;
+		default:
+			res = -EINVAL;
+		}
 }
 
 static long
