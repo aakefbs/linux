@@ -1049,47 +1049,69 @@ struct fuse_notify_retrieve_in {
 	uint64_t	dummy4;
 };
 
-
 enum fuse_uring_ioctl_cmd {
 	/* not correctly initialized when set */
 	FUSE_URING_IOCTL_CMD_INVALID    = 0,
 
-	/* The ioctl is a queue configuration command */
-	FUSE_URING_IOCTL_CMD_QUEUE_CFG = 1,
+	/* Ioctl to prepare communucation with io-uring */
+	FUSE_URING_IOCTL_CMD_RING_CFG   = 1,
+
+	/* Ring queue configuration ioctl */
+	FUSE_URING_IOCTL_CMD_QUEUE_CFG  = 2,
+};
+
+enum fuse_uring_cfg_flags {
+	/* server/deamon side requests numa awareness */
+	FUSE_URING_WANT_NUMA = 1ul << 0,
 };
 
 struct fuse_uring_cfg {
-	/* currently unused */
-	uint32_t flags;
+	/* struct flags */
+	uint64_t flags;
 
 	/* configuration command */
-	uint16_t cmd;
+	uint8_t cmd;
 
-	uint16_t padding;
+	uint8_t padding[7];
 
-	/* qid the config command is for */
-	uint32_t qid;
+	union {
+		struct fuse_ring_config {
+			/* number of queues */
+			uint32_t nr_queues;
 
-	/* number of queues */
-	uint32_t nr_queues;
+			/* number of foreground entries per queue */
+			uint32_t fg_queue_depth;
 
-	/* number of foreground entries per queue */
-	uint32_t fg_queue_depth;
+			/* number of background entries per queue */
+			uint32_t async_queue_depth;
 
-	/* number of background entries per queue */
-	uint32_t async_queue_depth;
+			/* argument (max data length) of a request */
+			uint32_t req_arg_len;
 
-	/* argument (data length) of a request */
-	uint32_t req_arg_len;
+			/*
+			 * buffer size userspace allocated per request buffer
+			 * from the mmaped queue buffer
+			 * */
+			uint32_t user_req_buf_sz;
 
-	/* numa node this queue runs on; UINT32_MAX if any*/
-	uint32_t numa_node_id;
+			/* ring config flags */
+			uint32_t numa_aware:1;
+		} rconf;
 
-	/* /dev/fuse fd that initiated the mount. */
-	uint32_t control_fd;
+		struct fuse_ring_queue_config {
+			/* mmaped buffser address */
+			uint64_t uaddr;
 
-	/* reserved space for future additions */
-	uint64_t reserve[8];
+			/* qid the command is for */
+			uint32_t qid;
+
+			/* /dev/fuse fd that initiated the mount. */
+			uint32_t control_fd;
+		} qconf;
+
+		/* space for future additions */
+		uint8_t union_size[128];
+	};
 };
 
 /* Device ioctls: */
@@ -1213,7 +1235,6 @@ struct fuse_supp_groups {
  * This structure mapped onto the
  */
 struct fuse_ring_req {
-
 	union {
 		/* The first 4K are command data */
 		char ring_header[FUSE_RING_HEADER_BUF_SIZE];
@@ -1260,7 +1281,7 @@ struct fuse_uring_cmd_req {
 	uint16_t tag;
 
 	/* pointer to struct fuse_uring_buf_req */
-	uint32_t padding;
+	uint32_t flags;
 };
 
 #endif /* _LINUX_FUSE_H */
