@@ -195,7 +195,7 @@ static void fuse_link_write_file(struct file *file)
 	spin_unlock(&fi->lock);
 }
 
-void fuse_finish_open(struct inode *inode, struct file *file)
+int fuse_finish_open(struct inode *inode, struct file *file)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -217,12 +217,16 @@ void fuse_finish_open(struct inode *inode, struct file *file)
 	}
 	if ((file->f_mode & FMODE_WRITE) && fc->writeback_cache)
 		fuse_link_write_file(file);
+
+	return 0;
 }
 
 int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = fm->fc;
+	struct fuse_file *ff;
 	int err;
 	bool is_wb_truncate = (file->f_flags & O_TRUNC) &&
 			  fc->atomic_o_trunc &&
@@ -251,14 +255,16 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
 		fuse_set_nowrite(inode);
 
 	err = fuse_do_open(fm, get_node_id(inode), file, isdir);
-	if (!err)
-		fuse_finish_open(inode, file);
+	if (!err) {
+		ff = file->private_data;
+		err = fuse_finish_open(inode, file);
+		if (err)
+			fuse_sync_release(fi, ff, file->f_flags);
+	}
 
 	if (is_wb_truncate || dax_truncate)
 		fuse_release_nowrite(inode);
 	if (!err) {
-		struct fuse_file *ff = file->private_data;
-
 		if (fc->atomic_o_trunc && (file->f_flags & O_TRUNC))
 			truncate_pagecache(inode, 0);
 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
@@ -368,7 +374,7 @@ void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
 	 * iput(NULL) is a no-op and since the refcount is 1 and everything's
 	 * synchronous, we are fine with not doing igrab() here"
 	 */
-	fuse_file_put(ff, true, false);
+	fuse_file_put(ff, true, fi && S_ISDIR(fi->inode.i_mode));
 }
 EXPORT_SYMBOL_GPL(fuse_sync_release);
 
