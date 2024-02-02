@@ -1051,7 +1051,7 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 	struct fuse_conn *fc = queue->fc;
 	int ret = 0;
 	bool async = false;
-	int nr_queue_init = 0;
+	int nr_ring_sqe;
 
 	spin_lock(&queue->lock);
 
@@ -1059,11 +1059,6 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 	if (queue->req_fg >= fc->ring.max_fg)
 		async = true;
 	fuse_uring_ent_release(ring_ent, queue, async, issue_flags);
-
-	/* daemon side registered all requests, this queue is complete */
-	if (queue->req_fg + queue->req_async == fc->ring.queue_depth)
-		nr_queue_init =
-			atomic_inc_return(&fc->ring.nr_queues_cmd_init);
 
 	if (queue->req_fg + queue->req_async > fc->ring.queue_depth) {
 		/* should be caught by ring state before and queue depth
@@ -1081,18 +1076,14 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 		ring_ent->state = FRRS_INIT;
 	}
 
-	pr_devel("%s:%d qid=%d tag=%d nr-fg=%d nr-async=%d nr_queue_init=%d\n",
-		__func__, __LINE__,
-		queue->qid, ring_ent->tag, queue->req_fg, queue->req_async,
-		nr_queue_init);
-
 	spin_unlock(&queue->lock);
 	if (ret)
 		goto out; /* erange */
 
 	WRITE_ONCE(ring_ent->cmd, cmd);
 
-	if (nr_queue_init == fc->ring.nr_queues) {
+	nr_ring_sqe = fc->ring.queue_depth * fc->ring.nr_queues;
+	if (atomic_inc_return(&fc->ring.nr_sqe_init) == nr_ring_sqe) {
 		fuse_uring_conn_cfg_limits(fc);
 		WRITE_ONCE(fc->ring.queues_stopped, false);
 		fc->ring.ready = 1;
