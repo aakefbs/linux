@@ -845,7 +845,7 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 
 	if (val) {
 
-		void *pgaddr;
+		void *pgaddr = NULL;
 		void *buf;
 
 		if (cs->is_uring) {
@@ -2560,6 +2560,8 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 		default:
 			res = -EINVAL;
 		}
+
+	return res;
 }
 
 static long

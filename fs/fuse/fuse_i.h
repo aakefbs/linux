@@ -595,7 +595,7 @@ enum fuse_ring_req_state {
 
 	FRRS_INVALD = 0,
 
-	/* request is basially initialied */
+	/* request is basially initialized */
 	FRRS_INIT = 1u << 0,
 
 	/* request is committed from user space and waiting for a new fuse req */
@@ -726,8 +726,8 @@ struct fuse_ring {
 	/* number of initialized queues with the ioctl */
 	int nr_queues_ioctl_init;
 
-	/* number of initialized queues with the uring cmd */
-	atomic_t nr_queues_cmd_init;
+	/* number of SQEs initialized */
+	atomic_t nr_sqe_init;
 
 	/* one queue per core or a single queue only ? */
 	unsigned int per_core_queue:1;
