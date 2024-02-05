@@ -598,31 +598,26 @@ enum fuse_ring_req_state {
 	/* request is basially initialized */
 	FRRS_INIT = 1u << 0,
 
-	/* request is committed from user space and waiting for a new fuse req */
-	FRRS_FUSE_FETCH_COMMIT = 1u << 1,
-
 	/* The ring request waits for a new fuse request */
-	 FRRS_FUSE_WAIT = 1u << 2,
+	FRRS_FUSE_WAIT = 1u << 1,
 
 	/* The ring req got assigned a fuse req */
-	FRRS_FUSE_REQ = 1u << 3,
+	FRRS_FUSE_REQ = 1u << 2,
 
 	/* request is in or on the way to user space */
-	FRRS_USERSPACE = 1u << 4,
-
-	/* process is in the process to get freed */
-	FRRS_FREEING   = 1u << 5,
+	FRRS_USERSPACE = 1u << 3,
 
 	/* fuse_req_end was already done */
-	FRRS_FUSE_REQ_END = 1u << 6,
+	FRRS_FUSE_REQ_END = 1u << 4,
 
-	/* And error in the uring cmd command receiving function
+	/*
+	 * And error in the uring cmd command receiving function
 	 * request will then go back to user space
 	 */
-	FRRS_CMD_ERR      = 1u << 7,
+	FRRS_CMD_ERR      = 1u << 5,
 
 	/* request is released */
-	FRRS_FREED = 1u << 8,
+	FRRS_FREED = 1u << 6,
 };
 
 /** A fuse ring entry, part of the ring queue */

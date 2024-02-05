@@ -301,6 +301,7 @@ __must_hold(ring_ent->queue->lock)
 		 str, fc, async, queue->qid, ring_ent->tag,
 		 queue->req_fg, queue->req_async);
 
+	ring_ent->state &= ~(FRRS_FUSE_WAIT | FRRS_FUSE_REQ_END);
 	ring_ent->state |= FRRS_FUSE_REQ;
 
 	return 0;
@@ -552,10 +553,10 @@ static void fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent,
 					    unsigned int issue_flags);
 
 /*
- * Release a ring request, it is no longer needed and can handle new data
+ * Put a ring request onto hold, it is no longer used for now.
  *
  */
-static void fuse_uring_ent_release(struct fuse_ring_ent *ring_ent,
+static void fuse_uring_ent_hold(struct fuse_ring_ent *ring_ent,
 					   struct fuse_ring_queue *queue,
 					   bool async, unsigned int issue_flags)
 __must_hold(&queue->lock)
@@ -580,17 +581,9 @@ __must_hold(&queue->lock)
 
 	fuse_uring_bit_set(ring_ent, async, __func__);
 
-	/* Check if this is call through shutdown/release task and already and
-	 * the request is about to be released - the state must not be reset
-	 * then, as state FRRS_FUSE_WAIT would introduce a double
-	 * io_uring_cmd_done
-	 */
-	if (ring_ent->state & FRRS_FREEING)
-		return;
-
 	/* Note: the bit in req->flag got already cleared in fuse_request_end */
 	ring_ent->rreq->flags = 0;
-	ring_ent->state = FRRS_FUSE_WAIT;
+	ring_ent->state |= FRRS_FUSE_WAIT;
 
 	return;
 
@@ -610,7 +603,7 @@ static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent,
 	struct list_head *head = async ? &queue->async_queue : &queue->fg_queue;
 
 	spin_lock(&ring_ent->queue->lock);
-	fuse_uring_ent_release(ring_ent, queue, async, issue_flags);
+	fuse_uring_ent_hold(ring_ent, queue, async, issue_flags);
 	send = fuse_uring_assign_ring_entry(ring_ent, head, async);
 	spin_unlock(&ring_ent->queue->lock);
 
@@ -644,15 +637,12 @@ __must_hold(&queue->lock)
 	bool may_release = false;
 	int state;
 
-	pr_info("%s fc=%p qid=%d tag=%d state=%llu\n",
-		 __func__, fc, queue->qid, ent->tag, ent->state);
-
 	if (ent->state & FRRS_FREED)
 		goto out; /* no work left, freed before */
 
 	state = ent->state;
 
-	if (state == FRRS_INIT || state == FRRS_FUSE_WAIT ||
+	if (state == FRRS_INIT || (state & FRRS_FUSE_WAIT) ||
 	    ((state & FRRS_USERSPACE) && queue->aborted)) {
 		ent->state |= FRRS_FREED;
 
@@ -668,10 +658,11 @@ __must_hold(&queue->lock)
 			_fuse_uring_shutdown_release_ent(ent);
 		may_release = true;
 	} else {
-		/* somewhere in between states, another thread should currently
+		/*
+		 * somewhere in between states, another thread should currently
 		 * handle it
 		 */
-		pr_devel("%s qid=%d tag=%d state=%llu\n",
+		pr_info("%s Cannot release qid=%d tag=%d state=%llu\n",
 			 __func__, queue->qid, ent->tag, ent->state);
 	}
 
@@ -1060,7 +1051,7 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 	/* register requests for foreground requests first, then backgrounds */
 	if (queue->req_fg >= fc->ring.max_fg)
 		async = true;
-	fuse_uring_ent_release(ring_ent, queue, async, issue_flags);
+	fuse_uring_ent_hold(ring_ent, queue, async, issue_flags);
 
 	if (queue->req_fg + queue->req_async > fc->ring.queue_depth) {
 		/* should be caught by ring state before and queue depth
@@ -1196,7 +1187,6 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	}
 
 	prev_state = ring_ent->state;
-	ring_ent->state |= FRRS_FUSE_FETCH_COMMIT;
 	ring_ent->state &= ~FRRS_USERSPACE;
 	ring_ent->need_cmd_done = 1;
 	spin_unlock(&queue->lock);
@@ -1229,9 +1219,8 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		}
 
 		if (!(prev_state & FRRS_USERSPACE)) {
-			pr_info("qid=%d tag=%d state %llu misses %d\n",
-				queue->qid, ring_ent->tag, ring_ent->state,
-				FRRS_USERSPACE);
+			pr_info("qid=%d tag=%d state %llu SQE already handled\n",
+				queue->qid, ring_ent->tag, ring_ent->state);
 			goto out;
 		}
 
