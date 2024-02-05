@@ -8,7 +8,10 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+
+#if defined(CONFIG_IO_URING)
 #include "dev_uring_i.h"
+#endif
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -28,9 +31,12 @@ MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
 static bool __read_mostly enable_uring;
+
+#if defined(CONFIG_IO_URING)
 module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
 	"Enable uring userspace communication through uring.");
+#endif
 
 static struct kmem_cache *fuse_req_cachep;
 
@@ -2415,6 +2421,7 @@ static int fuse_dev_ioctl_clone(struct file *file, int oldfd)
 	return res;
 }
 
+#if defined(CONFIG_IO_URING)
 /**
  * Configure the queue for t he given qid. First call will also initialize
  * the ring for this connection.
@@ -2461,6 +2468,7 @@ static int fuse_dev_uring_ioctl(struct file *file, unsigned long arg)
 
 	return res;
 }
+#endif
 
 static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
@@ -2475,11 +2483,13 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 
 		res = fuse_dev_ioctl_clone(file, oldfd);
 		break;
+#if defined(CONFIG_IO_URING)
 	case FUSE_DEV_IOC_URING:
 		if (!enable_uring)
 			return -ENOTTY;
 
 		return fuse_dev_uring_ioctl(file, arg);
+#endif
 	default:
 		res = -ENOTTY;
 		break;
@@ -2501,8 +2511,10 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+#if defined(CONFIG_IO_URING)
 	.mmap		= fuse_uring_mmap,
 	.uring_cmd	= fuse_uring_cmd,
+#endif
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 

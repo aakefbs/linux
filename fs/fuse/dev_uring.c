@@ -25,6 +25,7 @@
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/io_uring.h>
+#include <linux/io_uring/cmd.h>
 #include <linux/topology.h>
 
 /* default monitor interval for a dying daemon */
@@ -1093,7 +1094,7 @@ out:
 	return ret;
 }
 
-struct fuse_ring_queue *
+static struct fuse_ring_queue *
 fuse_uring_get_verify_queue(struct fuse_conn *fc,
 			 const struct fuse_uring_cmd_req *cmd_req,
 			 unsigned int issue_flags)
