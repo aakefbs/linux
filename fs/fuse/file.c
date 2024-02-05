@@ -7,7 +7,10 @@
 */
 
 #include "fuse_i.h"
+
+#if defined(CONFIG_IO_URING)
 #include "dev_uring_i.h"
+#endif
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>

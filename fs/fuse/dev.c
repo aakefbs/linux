@@ -8,7 +8,10 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+
+#if defined(CONFIG_IO_URING)
 #include "dev_uring_i.h"
+#endif
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -28,9 +31,12 @@ MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
 static bool __read_mostly enable_uring;
+
+#if defined(CONFIG_IO_URING)
 module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
 	"Enable uring userspace communication through uring.");
+#endif
 
 static struct kmem_cache *fuse_req_cachep;
 
@@ -2524,6 +2530,7 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
  */
 static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 {
+#if defined(CONFIG_IO_URING)
 	int res;
 	struct fuse_uring_cfg cfg;
 	struct fuse_dev *fud;
@@ -2561,7 +2568,10 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 			res = -EINVAL;
 		}
 
-	return res;
+		return res;
+#else
+	return -ENOTTY
+#endif
 }
 
 static long
@@ -2600,8 +2610,10 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+#if defined(CONFIG_IO_URING)
 	.mmap		= fuse_uring_mmap,
 	.uring_cmd	= fuse_uring_cmd,
+#endif
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 
