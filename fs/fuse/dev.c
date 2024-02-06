@@ -2363,7 +2363,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		fuse_dev_end_requests(&to_end);
 
 		if (fc->ring.configured && !fc->ring.queues_stopped) {
-			fuse_uring_end_requests(fc);
+			fuse_uring_abort_end_requests(fc);
 			fuse_uring_stop_queues(fc);
 		}
 

@@ -51,16 +51,24 @@ fuse_uring_get_queue(struct fuse_conn *fc, int qid)
 }
 
 /* Abort all list queued request on the given ring queue */
-static void fuse_uring_end_queue_requests(struct fuse_ring_queue *queue)
+static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
 {
+	struct fuse_req *req;
+
 	spin_lock(&queue->lock);
 	queue->aborted = 1;
+
+	list_for_each_entry(req, &queue->fg_queue, list)
+		clear_bit(FR_PENDING, &req->flags);
 	fuse_dev_end_requests(&queue->fg_queue);
+
+	list_for_each_entry(req, &queue->async_queue, list)
+		clear_bit(FR_PENDING, &req->flags);
 	fuse_dev_end_requests(&queue->async_queue);
 	spin_unlock(&queue->lock);
 }
 
-void fuse_uring_end_requests(struct fuse_conn *fc)
+void fuse_uring_abort_end_requests(struct fuse_conn *fc)
 {
 	int qid;
 
@@ -71,7 +79,7 @@ void fuse_uring_end_requests(struct fuse_conn *fc)
 		if (!queue->configured)
 			continue;
 
-		fuse_uring_end_queue_requests(queue);
+		fuse_uring_abort_end_queue_requests(queue);
 	}
 }
 
