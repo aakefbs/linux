@@ -21,7 +21,7 @@ struct fuse_uring_mbuf {
 	void *ubuf; /* mmaped address */
 };
 
-void fuse_uring_end_requests(struct fuse_conn *fc);
+void fuse_uring_abort_end_requests(struct fuse_conn *fc);
 int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req);
 int fuse_uring_conn_cfg(struct fuse_conn *fc,
 			struct fuse_ring_config *rcfg);
