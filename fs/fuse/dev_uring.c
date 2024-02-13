@@ -198,17 +198,17 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
 	struct fuse_conn *fc = ring_ent->queue->fc;
 	struct fuse_ring_req *rreq = ring_ent->rreq;
 	struct fuse_req *req = ring_ent->fuse_req;
+	struct fuse_ring_queue *queue = ring_ent->queue;
 	int err = 0;
 
 	pr_devel("%s:%d ring-req=%p fuse_req=%p state=%llu args=%p\n", __func__,
 		 __LINE__, ring_ent, ring_ent->fuse_req, ring_ent->state, req->args);
 
 	spin_lock(&ring_ent->queue->lock);
-	if (unlikely((ring_ent->state & FRRS_USERSPACE) ||
+	if (WARN_ON((ring_ent->state & FRRS_USERSPACE) ||
 		     (ring_ent->state & FRRS_FREED))) {
-		pr_err("ring-req=%p buf_req=%p invalid state %llu on send\n",
-		       ring_ent, rreq, ring_ent->state);
-		WARN_ON(1);
+		pr_err("qid=%d tag=%d ring-req=%p buf_req=%p invalid state %llu on send\n",
+		       queue->qid, ring_ent->tag, ring_ent, rreq, ring_ent->state);
 		err = -EIO;
 	} else
 		ring_ent->state |= FRRS_USERSPACE;
@@ -565,8 +565,8 @@ static void fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent,
  *
  */
 static void fuse_uring_ent_hold(struct fuse_ring_ent *ring_ent,
-					   struct fuse_ring_queue *queue,
-					   bool async, unsigned int issue_flags)
+				struct fuse_ring_queue *queue,
+				bool async, unsigned int issue_flags)
 __must_hold(&queue->lock)
 {
 	struct fuse_conn *fc = queue->fc;
@@ -576,11 +576,10 @@ __must_hold(&queue->lock)
 		__func__, fc, ring_ent->queue->qid, ring_ent->tag,
 		ring_ent->state, async);
 
-	if (ring_ent->state & FRRS_USERSPACE) {
+	if (WARN_ON(ring_ent->state & FRRS_USERSPACE)) {
 		pr_warn("%s qid=%d tag=%d state=%llu async=%d\n",
 			__func__, ring_ent->queue->qid, ring_ent->tag,
 			ring_ent->state, async);
-		WARN_ON(1);
 		return;
 	}
 
@@ -1054,8 +1053,6 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 	bool async = false;
 	int nr_ring_sqe;
 
-	spin_lock(&queue->lock);
-
 	/* register requests for foreground requests first, then backgrounds */
 	if (queue->req_fg >= fc->ring.max_fg)
 		async = true;
@@ -1077,7 +1074,6 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 		ring_ent->state = FRRS_INIT;
 	}
 
-	spin_unlock(&queue->lock);
 	if (ret)
 		goto out; /* erange */
 
@@ -1166,7 +1162,6 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_ent *ring_ent = NULL;
 	u32 cmd_op = cmd->cmd_op;
-	u64 prev_state;
 	int ret = 0;
 
 	queue = fuse_uring_get_verify_queue(fc, cmd_req, issue_flags);
@@ -1190,27 +1185,28 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		 * only, on daemon PF_EXITING?
 		 */
 		ret = -ENOTCONN;
-		spin_unlock(&queue->lock);
-		goto out;
+		goto err_unlock;
 	}
-
-	prev_state = ring_ent->state;
-	ring_ent->state &= ~FRRS_USERSPACE;
-	ring_ent->need_cmd_done = 1;
-	spin_unlock(&queue->lock);
 
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
-		if (prev_state != FRRS_INIT) {
-			pr_info_ratelimited("register req state %llu expected %d",
-					    prev_state, FRRS_INIT);
+		if (ring_ent->state != FRRS_INIT) {
+			pr_info_ratelimited("qid=%d tag=%d register req state %llu expected %d",
+					    cmd_req->qid, cmd_req->tag,
+					    ring_ent->state, FRRS_INIT);
 			ret = -EINVAL;
-			goto out;
+			goto err_unlock;
 
 			/* XXX error injection or test with malicious daemon */
 		}
 
 		ret = fuse_uring_fetch(ring_ent, cmd, issue_flags);
+		if (ret)
+			goto err_unlock;
+
+		ring_ent->state &= ~FRRS_USERSPACE;
+		ring_ent->need_cmd_done = 1;
+		spin_unlock(&queue->lock);
 
 		/* In combination with requesting process (application) seesaw
 		 * setting (see request_wait_answer), the application will
@@ -1223,14 +1219,18 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
 		if (unlikely(!fc->ring.ready)) {
 			pr_info("commit and fetch, but the ring is not ready yet");
-			goto out;
+			goto err_unlock;
 		}
 
-		if (!(prev_state & FRRS_USERSPACE)) {
+		if (!(ring_ent->state & FRRS_USERSPACE)) {
 			pr_info("qid=%d tag=%d state %llu SQE already handled\n",
 				queue->qid, ring_ent->tag, ring_ent->state);
-			goto out;
+			goto err_unlock;
 		}
+
+		ring_ent->state &= ~FRRS_USERSPACE;
+		ring_ent->need_cmd_done = 1;
+		spin_unlock(&queue->lock);
 
 		/* XXX Test inject error */
 
@@ -1251,13 +1251,20 @@ out:
 
 	if (ret < 0) {
 		if (ring_ent != NULL) {
-			spin_lock(&queue->lock);
-			ring_ent->state |= (FRRS_CMD_ERR | FRRS_USERSPACE);
-			ring_ent->need_cmd_done = 0;
-			spin_unlock(&queue->lock);
+			pr_info("error: uring cmd op=%d, qid=%d tag=%d ret=%d\n",
+				 cmd_op, cmd_req->qid, cmd_req->tag, ret);
+
+			/* must not change the entry state, as userspace
+			 * might have sent random data, but valid requests
+			 * might be registered already - don't confuse those.
+			 */
 		}
 		io_uring_cmd_done(cmd, ret, 0, issue_flags);
 	}
 
 	return -EIOCBQUEUED;
+
+err_unlock:
+	spin_unlock(&queue->lock);
+	goto out;
 }
