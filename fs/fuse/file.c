@@ -1734,12 +1734,16 @@ __acquires(fi->lock)
 	args->force = true;
 	args->nocreds = true;
 
+	/*
+	 * Must not be spin-locked with fuse-over-io-uring, as
+	 * io_uring_cmd_done takes a mutex lock
+	 */
+	spin_unlock(&fi->lock);
 	err = fuse_simple_background(fm, args, GFP_ATOMIC);
 	if (err == -ENOMEM) {
-		spin_unlock(&fi->lock);
 		err = fuse_simple_background(fm, args, GFP_NOFS | __GFP_NOFAIL);
-		spin_lock(&fi->lock);
 	}
+	spin_lock(&fi->lock);
 
 	/* Fails on broken connection only */
 	if (unlikely(err))
