@@ -607,9 +607,18 @@ struct fuse_ring_ent {
 #define FUSE_URING_MAX_QUEUE_DEPTH 32768
 
 struct fuse_ring_queue {
-	unsigned long flags;
+	/*
+	 * Each queue should have exactly one server (userspace) thread
+	 * assigned
+	 */
+	struct task_struct *server_task;
 
 	struct fuse_conn *fc;
+
+	unsigned long flags;
+
+	/* issue flags when running in io-uring task context */
+	unsigned uring_cmd_issue_flags;
 
 	int qid;
 

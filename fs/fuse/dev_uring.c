@@ -124,7 +124,7 @@ fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
 	send = fuse_uring_ent_release_and_fetch(ring_ent, issue_flags);
 	if (send) {
 		/* called within uring context - IO_URING_F_UNLOCKED not set */
-		fuse_uring_send_to_ring(ring_ent, 0);
+		fuse_uring_send_to_ring(ring_ent, issue_flags);
 	}
 }
 
@@ -354,6 +354,7 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	struct list_head *head;
 	int *queue_avail;
 	int cpu_off;
+	int issue_flags;
 
 	/* async has on a different core (see below) introduces context
 	 * switching - should be avoided for small requests
@@ -440,10 +441,28 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 			ring_ent = NULL;
 		}
 	}
+
+	/*
+	 * If current_task == queue->server_task sending requests to the
+	 * ring is in io-uring task context through fuse request completion,
+	 * but without the knowledge of fuse_uring. It has to use issue_flags
+	 * stored in the queue in this case. And is the reason why
+	 * only a single server thread can access the ring queue at a time
+	 *
+	 * Alternative solution: Do not take an entry above just add to the list.
+	 *
+	 * XXX: Detect using current_task->io_uring and then set 0 as issue_flags?
+	 *
+	 */
+	if (ring_ent != NULL) {
+		issue_flags = current == queue->server_task ?
+			queue->uring_cmd_issue_flags : IO_URING_F_UNLOCKED;
+	}
+
 	spin_unlock(&queue->lock);
 
 	if (ring_ent != NULL)
-		fuse_uring_send_to_ring(ring_ent, IO_URING_F_UNLOCKED);
+		fuse_uring_send_to_ring(ring_ent, issue_flags);
 
 	return 0;
 
@@ -869,6 +888,7 @@ int fuse_uring_queue_cfg(struct fuse_conn *fc,
 	fuse_uring_ioctl_mem_reg(fc, queue, qcfg->uaddr);
 	mutex_unlock(&fc->ring.start_stop_lock);
 
+	queue->server_task = NULL;
 	queue->qid = qcfg->qid;
 	queue->fc = fc;
 	queue->req_fg = 0;
@@ -1187,6 +1207,28 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		goto err_unlock;
 	}
 
+	if (unlikely(queue->server_task != current))
+	{
+		if (queue->server_task == NULL) {
+			queue->server_task = current;
+		} else {
+			/*
+			 * XXX TBD Needs to switch to slow mode, with a single wq
+			 * doing all the work
+			 */
+			pr_info("Unsupported, multiple threads accessing the same fuse ring queue\n");
+			ret = -ENOTSUPP;
+			goto err_unlock;
+		}
+	}
+
+	/*
+	 * This is the reason why only a single server thread can acccess the
+	 * ring queue at a time.
+	 * XXX TBD Use wq work when this happens
+	 */
+	queue->uring_cmd_issue_flags = issue_flags;
+
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
 		if (ring_ent->state != FRRS_INIT) {
@@ -1241,7 +1283,7 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	default:
 		ret = -EINVAL;
 		pr_devel("Unknown uring command %d", cmd_op);
-		goto out;
+		goto err_unlock;
 	}
 
 out:
