@@ -685,7 +685,7 @@ struct fuse_ring_queue {
 	struct list_head fg_queue;
 
 	unsigned int configured:1;
-	unsigned int aborted:1;
+	unsigned int stopped:1;
 
 	/* size depends on queue depth */
 	struct fuse_ring_ent ring_ent[] ____cacheline_aligned_in_smp;
@@ -739,17 +739,14 @@ struct fuse_ring {
 	/* Is the ring completely iocl configured */
 	unsigned int configured:1;
 
-	/* Is the ring read to take requests */
-	unsigned int ready:1;
-
 	/* numa aware memory allocation */
 	unsigned int numa_aware:1;
 
-	/* userspace sent a stop ioctl */
-	unsigned int stop_requested;
+	/* Is the ring read to take requests */
+	unsigned int ready:1;
 
 	/* used on shutdown */
-	bool queues_stopped;
+	bool all_queues_stopped;
 
 	struct mutex start_stop_lock;
 
@@ -1089,12 +1086,10 @@ struct fuse_conn {
 	struct idr backing_files_map;
 #endif
 
-	/*
-	 * XXX Move to struct fuse_dev?
-	 * Allocate dynamically!
-	 */
+#ifdef CONFIG_FUSE_IO_URING
 	/**  uring connection information*/
 	struct fuse_ring ring;
+#endif
 };
 
 /*

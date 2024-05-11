@@ -7,8 +7,9 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
-#if defined(CONFIG_IO_URING)
+#if defined(CONFIG_FUSE_IO_URING)
 #include "dev_uring_i.h"
 #endif
 
@@ -941,9 +942,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		fuse_backing_files_init(fc);
 
-	init_waitqueue_head(&fc->ring.stop_waitq);
-	mutex_init(&fc->ring.start_stop_lock);
-	fc->ring.mem_buf_map = RB_ROOT;
+	fuse_uring_conn_init(fc);
 
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);
@@ -1944,10 +1943,7 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 		mutex_unlock(&fuse_mutex);
 	}
 
-	if (fc->ring.nr_queues)
-		fuse_uring_ring_destruct(fc);
-
-	mutex_destroy(&fc->ring.start_stop_lock);
+	fuse_uring_conn_destruct(fc);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_destroy);
 

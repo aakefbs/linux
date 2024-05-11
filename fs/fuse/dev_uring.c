@@ -8,6 +8,8 @@
 #include "fuse_dev_i.h"
 #include "dev_uring_i.h"
 
+#include "linux/compiler_types.h"
+#include "linux/spinlock.h"
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/poll.h>
@@ -29,34 +31,19 @@
 #include <linux/topology.h>
 #include <linux/io_uring/cmd.h>
 
-/* default monitor interval for a dying daemon */
-#define FURING_DAEMON_MON_PERIOD (5 * HZ)
-
 static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent,
 					     unsigned int issue_flags);
 static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
 				    unsigned int issue_flags);
-
-static struct fuse_ring_queue *
-fuse_uring_get_queue(struct fuse_conn *fc, int qid)
-{
-	char *ptr = (char *)fc->ring.queues;
-
-	if (unlikely(qid > fc->ring.nr_queues)) {
-		WARN_ON(1);
-		qid = 0;
-	}
-
-	return (struct fuse_ring_queue *)(ptr + qid * fc->ring.queue_size);
-}
-
+static void fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent,
+					    unsigned int issue_flags);
 /* Abort all list queued request on the given ring queue */
 static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
 {
 	struct fuse_req *req;
 
 	spin_lock(&queue->lock);
-	queue->aborted = 1;
+	queue->stopped = 1;
 
 	list_for_each_entry(req, &queue->fg_queue, list)
 		clear_bit(FR_PENDING, &req->flags);
@@ -108,7 +95,7 @@ fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
 	if (already) {
 		struct fuse_ring_queue *queue = ring_ent->queue;
 
-		if (!queue->aborted) {
+		if (!queue->stopped) {
 			pr_info("request end not needed state=%llu end-bit=%d\n",
 				ring_ent->state, ring_ent->need_req_end);
 			WARN_ON(1);
@@ -413,7 +400,7 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 
 	spin_lock(&queue->lock);
 
-	if (unlikely(queue->aborted)) {
+	if (unlikely(queue->stopped)) {
 		res = -ENOTCONN;
 		goto err_unlock;
 	}
@@ -574,10 +561,6 @@ out:
 	fuse_uring_req_end_and_get_next(ring_ent, set_err, err, issue_flags);
 }
 
-/* XXX */
-static void fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent,
-					    unsigned int issue_flags);
-
 /*
  * Put a ring request onto hold, it is no longer used for now.
  *
@@ -601,7 +584,7 @@ __must_hold(&queue->lock)
 		return;
 	}
 
-	if (unlikely(fc->ring.stop_requested))
+	if (unlikely(!fc->connected))
 		goto shutdown;
 
 	fuse_uring_bit_set(ring_ent, async, __func__);
@@ -668,7 +651,7 @@ __must_hold(&queue->lock)
 	state = ent->state;
 
 	if (state == FRRS_INIT || (state & FRRS_FUSE_WAIT) ||
-	    ((state & FRRS_USERSPACE) && queue->aborted)) {
+	    ((state & FRRS_USERSPACE) && queue->stopped)) {
 		ent->state |= FRRS_FREED;
 
 		if (ent->need_cmd_done) {
@@ -699,7 +682,7 @@ out:
 		pr_devel("free-req fc=%p qid=%d tag=%d refs=%d\n",
 			 fc, queue->qid, ent->tag, refs);
 		if (refs == 0) {
-			WRITE_ONCE(fc->ring.queues_stopped, true);
+			WRITE_ONCE(fc->ring.all_queues_stopped, true);
 			wake_up_all(&fc->ring.stop_waitq);
 		}
 	}
@@ -713,7 +696,7 @@ __must_hold(&queue->lock)
 	bool empty =
 		(list_empty(&queue->fg_queue) && list_empty(&queue->fg_queue));
 
-	if (!empty && !queue->aborted)
+	if (!empty)
 		return;
 
 	for (tag = 0; tag < fc->ring.queue_depth; tag++) {
@@ -730,8 +713,6 @@ void fuse_uring_stop_queues(struct fuse_conn *fc)
 {
 	int qid;
 
-	fc->ring.ready = 0;
-
 	for (qid = 0; qid < fc->ring.nr_queues; qid++) {
 		struct fuse_ring_queue *queue =
 			fuse_uring_get_queue(fc, qid);
@@ -739,7 +720,9 @@ void fuse_uring_stop_queues(struct fuse_conn *fc)
 		if (!queue->configured)
 			continue;
 
+		spin_lock(&queue->lock);
 		fuse_uring_stop_queue(queue);
+		spin_unlock(&queue->lock);
 	}
 }
 
@@ -806,7 +789,7 @@ int fuse_uring_conn_cfg(struct fuse_conn *fc,
 	if (WARN_ON(fc->ring.queues))
 		return -EINVAL;
 
-	fc->ring.queues_stopped = true;
+	fc->ring.all_queues_stopped = true;
 	fc->ring.numa_aware = rcfg->numa_aware;
 	fc->ring.nr_queues = rcfg->nr_queues;
 	fc->ring.per_core_queue = rcfg->nr_queues > 1;
@@ -917,7 +900,7 @@ int fuse_uring_queue_cfg(struct fuse_conn *fc,
 	}
 
 	queue->configured = 1;
-	queue->aborted = 0;
+	queue->stopped = 0;
 	fc->ring.nr_queues_ioctl_init++;
 	if (fc->ring.nr_queues_ioctl_init == fc->ring.nr_queues) {
 		pr_devel("fc=%p nr-queues=%zu depth=%zu ioctl ready\n",
@@ -1101,7 +1084,7 @@ static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
 	nr_ring_sqe = fc->ring.queue_depth * fc->ring.nr_queues;
 	if (atomic_inc_return(&fc->ring.nr_sqe_init) == nr_ring_sqe) {
 		fuse_uring_conn_cfg_limits(fc);
-		WRITE_ONCE(fc->ring.queues_stopped, false);
+		WRITE_ONCE(fc->ring.all_queues_stopped, false);
 		fc->ring.ready = 1;
 	}
 
@@ -1124,7 +1107,7 @@ fuse_uring_get_verify_queue(struct fuse_conn *fc,
 		goto err;
 	}
 
-	if (unlikely(fc->ring.stop_requested)) {
+	if (unlikely(!fc->connected)) {
 		ret = -ENOTCONN;
 		goto err;
 	}
@@ -1150,7 +1133,7 @@ fuse_uring_get_verify_queue(struct fuse_conn *fc,
 	}
 
 	if (unlikely(!fc->ring.configured || !queue->configured ||
-		     queue->aborted)) {
+		     queue->stopped)) {
 		pr_info("Ring or queue (qid=%u) not ready.\n", cmd_req->qid);
 		ret = -ENOTCONN;
 		goto err;
@@ -1196,7 +1179,7 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		 cmd_op, cmd_req->qid, queue, cmd_req->tag, ring_ent);
 
 	spin_lock(&queue->lock);
-	if (unlikely(queue->aborted)) {
+	if (unlikely(queue->stopped)) {
 		/* XXX how to ensure queue still exists? Add
 		 * an rw fc->ring.stop lock? And take that at the beginning
 		 * of this function? Better would be to advise uring
@@ -1259,7 +1242,7 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		break;
 	case FUSE_URING_REQ_COMMIT_AND_FETCH:
 		if (unlikely(!fc->ring.ready)) {
-			pr_info("commit and fetch, but the ring is not ready yet");
+			pr_info("commit and fetch, but fuse-uringis not ready.");
 			goto err_unlock;
 		}
 

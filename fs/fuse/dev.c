@@ -8,10 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
-
-#if defined(CONFIG_IO_URING)
 #include "dev_uring_i.h"
-#endif
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -30,12 +27,11 @@
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
+#if defined(CONFIG_FUSE_IO_URING)
 static bool __read_mostly enable_uring;
-
-#if defined(CONFIG_IO_URING)
 module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
-	"Enable uring userspace communication through uring.");
+		 "Enable uring userspace communication through uring.");
 #endif
 
 static struct kmem_cache *fuse_req_cachep;
@@ -233,7 +229,7 @@ __releases(fiq->lock)
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 
-	if (allow_uring && fc->ring.ready) {
+	if (allow_uring && fuse_uring_ready(fc)) {
 		int res;
 
 		/* this lock is not needed at all for ring req handling */
@@ -336,11 +332,12 @@ void fuse_request_end(struct fuse_req *req)
 		flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
 	} else {
-		if (fc->ring.per_core_queue) {
+		if (fuse_per_core_queue(fc)) {
 			/* Wake up waiter sleeping in request_wait_answer() */
 			__wake_up_on_current_cpu(&req->waitq, TASK_NORMAL, NULL);
-		} else
+		} else {
 			wake_up(&req->waitq);
+		}
 	}
 
 	if (test_bit(FR_ASYNC, &req->flags))
@@ -394,7 +391,7 @@ static void request_wait_answer(struct fuse_req *req)
 	 * is that the while the ring thread is on its way to wait, it disturbs
 	 * the application and application might get migrated away
 	 */
-	if (fc->ring.per_core_queue)
+	if (fuse_per_core_queue(fc))
 		current->seesaw = 1;
 
 	/* When running over uring and core affined userspace threads, we
@@ -414,7 +411,7 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Ideal would to tell the scheduler that ring threads are not disturbing
 	 * that migration away from it should very very rarely happen.
 	 */
-	if (fc->ring.ready)
+	if (fuse_uring_ready(fc))
 		migrate_disable();
 
 	if (!fc->no_interrupt) {
@@ -554,8 +551,6 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 		atomic_inc(&fc->num_waiting);
 		req = fuse_request_alloc(fm, GFP_KERNEL | __GFP_NOFAIL);
 		if (unlikely(!req)) {
-			/* should only happen with uring on shutdown */
-			WARN_ON(!fc->ring.configured);
 			ret = -ENOTCONN;
 			goto err;
 		}
@@ -632,7 +627,7 @@ static int fuse_request_queue_background(struct fuse_req *req)
 
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
 
-	if (fc->ring.ready)
+	if (fuse_uring_ready(fc))
 		return fuse_request_queue_background_uring(fc, req);
 
 	if (!test_bit(FR_WAITING, &req->flags)) {
@@ -2315,9 +2310,9 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		fc->connected = 0;
 		spin_unlock(&fc->bg_lock);
 
-		fuse_set_initialized(fc);
+		fuse_uring_set_stopped(fc);
 
-		WRITE_ONCE(fc->ring.stop_requested, 1);
+		fuse_set_initialized(fc);
 
 		list_for_each_entry(fud, &fc->devices, entry) {
 			struct fuse_pqueue *fpq = &fud->pq;
@@ -2362,11 +2357,11 @@ void fuse_abort_conn(struct fuse_conn *fc)
 
 		fuse_dev_end_requests(&to_end);
 
-		if (fc->ring.configured && !fc->ring.queues_stopped) {
-			fuse_uring_abort_end_requests(fc);
-			fuse_uring_stop_queues(fc);
-		}
-
+		/*
+		 * fc->lock must not be taken to avoid conflicts with io-uring
+		 * locks
+		 */
+		fuse_uring_abort(fc);
 	} else {
 		spin_unlock(&fc->lock);
 	}
@@ -2380,10 +2375,7 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 
 	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 
-	/* XXX use struct completion? */
-	if (fc->ring.nr_queues)
-		wait_event(fc->ring.stop_waitq,
-			   READ_ONCE(fc->ring.queues_stopped) == true);
+	fuse_uring_wait_stopped_queues(fc);
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
@@ -2410,10 +2402,11 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		 * Or is this with io_uring and only ring devices left?
 		 * These devices will not receive a ->release() as long as
 		 * commands are not completed with io_uring_cmd_done
+		 *
 		 */
 		dev_cnt = atomic_dec_return(&fc->dev_count);
 		if (dev_cnt == 0 ||
-		   (fc->ring.ready && dev_cnt == fc->ring.nr_queues)) {
+		   fuse_uring_unset_ready_if_released(fc, dev_cnt)) {
 			WARN_ON(fc->iq.fasync != NULL);
 			fuse_abort_conn(fc);
 		}
@@ -2525,12 +2518,12 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
 }
 
 /**
- * Configure the queue for t he given qid. First call will also initialize
+ * Configure the queue for the given qid. First call will also initialize
  * the ring for this connection.
  */
 static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 {
-#if defined(CONFIG_IO_URING)
+#if defined(CONFIG_FUSE_IO_URING)
 	int res;
 	struct fuse_uring_cfg cfg;
 	struct fuse_dev *fud;
@@ -2570,7 +2563,7 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 
 		return res;
 #else
-	return -ENOTTY
+	return -ENOTTY;
 #endif
 }
 
@@ -2610,7 +2603,7 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
-#if defined(CONFIG_IO_URING)
+#if defined(CONFIG_FUSE_IO_URING)
 	.mmap		= fuse_uring_mmap,
 	.uring_cmd	= fuse_uring_cmd,
 #endif

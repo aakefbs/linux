@@ -6,7 +6,9 @@
 #ifndef _FS_FUSE_DEV_I_H
 #define _FS_FUSE_DEV_I_H
 
-#include <linux/types.h>
+#include "fuse_i.h"
+
+#include <linux/file.h>
 
 /* Ordinary requests have even IDs, while interrupts IDs are odd */
 #define FUSE_INT_REQ_BIT (1ULL << 0)

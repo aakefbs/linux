@@ -7,8 +7,9 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
-#if defined(CONFIG_IO_URING)
+#if defined(CONFIG_FUSE_IO_URING)
 #include "dev_uring_i.h"
 #endif
 
@@ -974,7 +975,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	 * Check here and not only in dev_uring.c as we have control in
 	 * fuse_simple_request if it should wake up on the same core,
 	 * avoids application core switching */
-	if (async && fc->ring.ready && count <= FUSE_URING_MIN_ASYNC_SIZE)
+	if (async && fuse_uring_ready(fc) && count <= FUSE_URING_MIN_ASYNC_SIZE)
 		async = 0;
 
 	ap->args.out_pages = true;
@@ -3071,8 +3072,9 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	iov_iter_reexpand(iter, iov_iter_count(iter) + shortened);
 
 	if (io->async) {
+		struct fuse_conn *fc = ff->fm->fc;
 		bool blocking = io->blocking;
-		const bool is_ring = ff->fm->fc->ring.ready;
+		const bool is_ring = fuse_uring_ready(fc);
 
 		fuse_aio_complete(io, ret < 0 ? ret : 0, -1);
 
