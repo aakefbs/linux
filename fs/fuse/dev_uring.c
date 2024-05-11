@@ -638,7 +638,7 @@ __must_hold(&queue->lock)
  */
 static void fuse_uring_shutdown_release_ent(struct fuse_ring_ent *ent,
 					    unsigned int issue_flags)
-__must_hold(&queue->lock)
+__must_hold(ent->queue->lock)
 {
 	struct fuse_ring_queue *queue = ent->queue;
 	struct fuse_conn *fc = queue->fc;
@@ -657,8 +657,15 @@ __must_hold(&queue->lock)
 		if (ent->need_cmd_done) {
 			pr_devel("qid=%d tag=%d sending cmd_done\n",
 				queue->qid, ent->tag);
-			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0,
-					  issue_flags);
+
+			/*
+			 * avoid conflicts with io-uring locks,
+			 * releasing/re-acquiring is not critical as this
+			 * is in shutdown code path
+			 */
+			spin_unlock(&queue->lock);
+			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0, issue_flags);
+			spin_lock(&queue->lock);
 			ent->need_cmd_done = 0;
 		}
 
