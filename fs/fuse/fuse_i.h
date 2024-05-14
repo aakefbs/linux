@@ -655,7 +655,7 @@ struct fuse_ring_queue {
 	 */
 	struct task_struct *server_task;
 
-	struct fuse_conn *fc;
+	struct fuse_ring *ring;
 
 	unsigned long flags;
 
@@ -664,9 +664,10 @@ struct fuse_ring_queue {
 
 	int qid;
 
-	/* This bitmap holds, which entries are available in the fuse_ring_ent
+	/*
+	 * This bitmap holds, which entries are available in the fuse_ring_ent
 	 * array.
-	 * XXX: Is there a way to make this dynamic
+	 * XXX: Make the size server config dynamic
 	 */
 	DECLARE_BITMAP(req_avail_map, FUSE_URING_MAX_QUEUE_DEPTH);
 
@@ -699,6 +700,8 @@ struct fuse_ring_queue {
  * for uring communication
  */
 struct fuse_ring {
+	/* back pointer to fuse_conn */
+	struct fuse_conn *fc;
 
 	/* number of ring queues */
 	size_t nr_queues;
@@ -1091,7 +1094,7 @@ struct fuse_conn {
 
 #ifdef CONFIG_FUSE_IO_URING
 	/**  uring connection information*/
-	struct fuse_ring ring;
+	struct fuse_ring *ring;
 #endif
 };
 

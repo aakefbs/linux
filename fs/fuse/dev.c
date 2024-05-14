@@ -2547,6 +2547,7 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 	struct fuse_uring_cfg cfg;
 	struct fuse_dev *fud;
 	struct fuse_conn *fc;
+	struct fuse_ring *ring;
 
 	res = copy_from_user(&cfg, (void *)argp, sizeof(cfg));
 	if (res != 0)
@@ -2565,16 +2566,31 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 
 	switch (cfg.cmd) {
 		case FUSE_URING_IOCTL_CMD_RING_CFG:
-			mutex_lock(&fc->ring.start_stop_lock);
-			res = fuse_uring_conn_cfg(fc, &cfg.rconf);
-			mutex_unlock(&fc->ring.start_stop_lock);
+			if (READ_ONCE(fc->ring) == NULL)
+				ring = kzalloc(sizeof(*fc->ring), GFP_KERNEL);
+
+			spin_lock(&fc->lock);
+			if (fc->ring == NULL) {
+				fc->ring = ring;
+				fuse_uring_conn_init(fc->ring, fc);
+			} else {
+				kfree(ring);
+			}
+
+			spin_unlock(&fc->lock);
+			if (fc->ring == NULL)
+				return -ENOMEM;
+
+			mutex_lock(&fc->ring->start_stop_lock);
+			res = fuse_uring_conn_cfg(fc->ring, &cfg.rconf);
+			mutex_unlock(&fc->ring->start_stop_lock);
 
 			if (res != 0)
 				return res;
 			break;
 
 		case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
-			res = fuse_uring_queue_cfg(fc, &cfg.qconf);
+			res = fuse_uring_queue_cfg(fc->ring, &cfg.qconf);
 			break;
 		default:
 			res = -EINVAL;
