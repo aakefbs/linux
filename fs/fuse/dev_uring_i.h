@@ -134,29 +134,6 @@ __must_hold(fc->lock)
 	fuse_uring_set_stopped_queues(fc);
 }
 
-static inline bool
-fuse_uring_unset_ready_if_released(struct fuse_conn * fc,
-				   unsigned int dev_cnt)
-{
-	bool res = false;
-
-	spin_lock(&fc->lock);
-
-	/*
-	* XXX: This condition needs improvement
-	* (ring startup not complete, or never completes, racy, ...)
-	*/
-	if (fc->ring.ready && dev_cnt == fc->ring.nr_queues) {
-		fc->ring.ready = false;
-		fuse_uring_set_stopped_queues(fc);
-		res = true;
-	}
-
-	spin_unlock(&fc->lock);
-
-	return res;
-}
-
 static inline void
 fuse_uring_wait_stopped_queues(struct fuse_conn *fc)
 {
@@ -189,12 +166,6 @@ static inline void fuse_uring_set_stopped(struct fuse_conn *fc)
 static inline void fuse_uring_abort(struct fuse_conn *fc)
 {
 	return;
-}
-
-static inline bool fuse_uring_unset_ready_if_released(struct fuse_conn *fc,
-						      unsigned int dev_cnt)
-{
-	return false;
 }
 
 static inline void fuse_uring_wait_stopped_queues(struct fuse_conn *fc)
