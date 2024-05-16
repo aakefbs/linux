@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dev_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -25,6 +26,13 @@
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
+
+#if IS_ENABLED(CONFIG_FUSE_IO_URING)
+static bool __read_mostly enable_uring;
+module_param(enable_uring, bool, 0644);
+MODULE_PARM_DESC(enable_uring,
+		 "Enable uring userspace communication through uring.");
+#endif
 
 static struct kmem_cache *fuse_req_cachep;
 
@@ -2297,15 +2305,11 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	return 0;
 }
 
-static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
+static long _fuse_dev_ioctl_clone(struct file *file, int oldfd)
 {
 	int res;
-	int oldfd;
 	struct fuse_dev *fud = NULL;
 	struct fd f;
-
-	if (get_user(oldfd, argp))
-		return -EFAULT;
 
 	f = fdget(oldfd);
 	if (!f.file)
@@ -2327,6 +2331,16 @@ static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
 
 	fdput(f);
 	return res;
+}
+
+static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
+{
+	int oldfd;
+
+	if (get_user(oldfd, argp))
+		return -EFAULT;
+
+	return _fuse_dev_ioctl_clone(file, oldfd);
 }
 
 static long fuse_dev_ioctl_backing_open(struct file *file,
@@ -2364,8 +2378,65 @@ static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
 	return fuse_backing_close(fud->fc, backing_id);
 }
 
-static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
-			   unsigned long arg)
+/**
+ * Configure the queue for the given qid. First call will also initialize
+ * the ring for this connection.
+ */
+static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
+{
+#if IS_ENABLED(CONFIG_FUSE_IO_URING)
+	int res;
+	struct fuse_uring_cfg cfg;
+	struct fuse_dev *fud;
+	struct fuse_conn *fc;
+	struct fuse_ring *ring;
+
+	res = copy_from_user(&cfg, (void *)argp, sizeof(cfg));
+	if (res != 0)
+		return -EFAULT;
+
+	fud = fuse_get_dev(file);
+	if (fud == NULL)
+		return -ENODEV;
+	fc = fud->fc;
+
+	switch (cfg.cmd) {
+	case FUSE_URING_IOCTL_CMD_RING_CFG:
+		if (READ_ONCE(fc->ring) == NULL)
+			ring = kzalloc(sizeof(*fc->ring), GFP_KERNEL);
+
+		spin_lock(&fc->lock);
+		if (fc->ring == NULL) {
+			fc->ring = ring;
+			fuse_uring_conn_init(fc->ring, fc);
+		} else {
+			kfree(ring);
+		}
+
+		spin_unlock(&fc->lock);
+		if (fc->ring == NULL)
+			return -ENOMEM;
+
+		mutex_lock(&fc->ring->start_stop_lock);
+		res = fuse_uring_conn_cfg(fc->ring, &cfg.rconf);
+		mutex_unlock(&fc->ring->start_stop_lock);
+
+		if (res != 0)
+			return res;
+		break;
+	default:
+		res = -EINVAL;
+	}
+
+		return res;
+#else
+	return -ENOTTY;
+#endif
+}
+
+static long
+fuse_dev_ioctl(struct file *file, unsigned int cmd,
+	       unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
 
@@ -2379,8 +2450,10 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	case FUSE_DEV_IOC_BACKING_CLOSE:
 		return fuse_dev_ioctl_backing_close(file, argp);
 
-	default:
-		return -ENOTTY;
+	case FUSE_DEV_IOC_URING:
+		return fuse_uring_ioctl(file, argp);
+
+	default: return -ENOTTY;
 	}
 }
 
