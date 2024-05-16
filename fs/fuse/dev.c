@@ -2395,6 +2395,12 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 	if (res != 0)
 		return -EFAULT;
 
+	if (cfg.cmd == FUSE_URING_IOCTL_CMD_QUEUE_CFG) {
+		res = _fuse_dev_ioctl_clone(file, cfg.qconf.control_fd);
+		if (res != 0)
+			return res;
+	}
+
 	fud = fuse_get_dev(file);
 	if (fud == NULL)
 		return -ENODEV;
@@ -2423,6 +2429,10 @@ static long fuse_uring_ioctl(struct file *file, __u32 __user *argp)
 
 		if (res != 0)
 			return res;
+		break;
+		case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
+			fud->uring_dev = 1;
+			res = fuse_uring_queue_cfg(fc->ring, &cfg.qconf);
 		break;
 	default:
 		res = -EINVAL;
