@@ -16,6 +16,24 @@
 /* IORING_MAX_ENTRIES */
 #define FUSE_URING_MAX_QUEUE_DEPTH 32768
 
+enum fuse_ring_req_state {
+
+	/* request is basially initialized */
+	FRRS_INIT,
+
+	/* The ring request waits for a new fuse request */
+	FRRS_WAIT,
+
+	/* The ring req got assigned a fuse req */
+	FRRS_FUSE_REQ,
+
+	/* request is in or on the way to user space */
+	FRRS_USERSPACE,
+
+	/* request is released */
+	FRRS_FREED,
+};
+
 struct fuse_uring_mbuf {
 	struct rb_node rb_node;
 	void *kbuf; /* kernel allocated ring request buffer */
