@@ -1262,4 +1262,30 @@ struct fuse_supp_groups {
 /* The offset parameter is used to identify the request type */
 #define FUSE_URING_MMAP_OFF 0xf8000000ULL
 
+/**
+ * This structure mapped onto the
+ */
+struct fuse_ring_req {
+	union {
+		/* The first 4K are command data */
+		char ring_header[FUSE_RING_HEADER_BUF_SIZE];
+
+		struct {
+			uint64_t flags;
+
+			/* enum fuse_ring_buf_cmd */
+			uint32_t in_out_arg_len;
+			uint32_t padding;
+
+			/* kernel fills in, reads out */
+			union {
+				struct fuse_in_header in;
+				struct fuse_out_header out;
+			};
+		};
+	};
+
+	char in_out_arg[];
+};
+
 #endif /* _LINUX_FUSE_H */

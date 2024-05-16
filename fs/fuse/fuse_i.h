@@ -540,6 +540,9 @@ struct fuse_dev {
 
 	/** list entry on fc->devices */
 	struct list_head entry;
+
+	/** Is the device used for fuse-over-io-uring? */
+	unsigned int uring_dev : 1;
 };
 
 enum fuse_dax_mode {

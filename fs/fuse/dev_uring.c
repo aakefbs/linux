@@ -144,6 +144,39 @@ static char *fuse_uring_alloc_queue_buf(int size, int node)
 	return buf ? buf : ERR_PTR(-ENOMEM);
 }
 
+/*
+ * mmaped allocated buffers, but does not know which queue that is for
+ * This ioctl uses the userspace address as key to identify the kernel address
+ * and assign it to the kernel side of the queue.
+ */
+static int fuse_uring_ioctl_mem_reg(struct fuse_ring *ring,
+				    struct fuse_ring_queue *queue,
+				    uint64_t uaddr)
+{
+	struct rb_node *node;
+	struct fuse_uring_mbuf *entry;
+	int tag;
+
+	node = rb_find((const void *)uaddr, &ring->mem_buf_map,
+		       fuse_uring_rb_tree_buf_cmp);
+	if (!node)
+		return -ENOENT;
+	entry = rb_entry(node, struct fuse_uring_mbuf, rb_node);
+
+	rb_erase(node, &ring->mem_buf_map);
+
+	queue->queue_req_buf = entry->kbuf;
+
+	for (tag = 0; tag < ring->queue_depth; tag++) {
+		struct fuse_ring_ent *ent = &queue->ring_ent[tag];
+
+		ent->rreq = entry->kbuf + tag * ring->req_buf_sz;
+	}
+
+	kfree(node);
+	return 0;
+}
+
 /**
  * fuse uring mmap, per ring qeuue.
  * Userpsace maps a kernel allocated ring/queue buffer. For numa awareness,
@@ -234,3 +267,65 @@ out:
 
 	return ret;
 }
+
+int fuse_uring_queue_cfg(struct fuse_ring *ring,
+			 struct fuse_ring_queue_config *qcfg)
+{
+	int tag;
+	struct fuse_ring_queue *queue;
+
+	if (qcfg->qid >= ring->nr_queues) {
+		pr_info("fuse ring queue config: qid=%u >= nr-queues=%zu\n",
+			qcfg->qid, ring->nr_queues);
+		return -EINVAL;
+	}
+	queue = fuse_uring_get_queue(ring, qcfg->qid);
+
+	if (queue->configured) {
+		pr_info("fuse ring qid=%u already configured!\n", queue->qid);
+		return -EALREADY;
+	}
+
+	mutex_lock(&ring->start_stop_lock);
+	fuse_uring_ioctl_mem_reg(ring, queue, qcfg->uaddr);
+	mutex_unlock(&ring->start_stop_lock);
+
+	queue->qid = qcfg->qid;
+	queue->ring = ring;
+	spin_lock_init(&queue->lock);
+	INIT_LIST_HEAD(&queue->sync_fuse_req_queue);
+	INIT_LIST_HEAD(&queue->async_fuse_req_queue);
+
+	INIT_LIST_HEAD(&queue->sync_ent_avail_queue);
+	INIT_LIST_HEAD(&queue->async_ent_avail_queue);
+
+	INIT_LIST_HEAD(&queue->ent_in_userspace);
+
+	for (tag = 0; tag < ring->queue_depth; tag++) {
+		struct fuse_ring_ent *ent = &queue->ring_ent[tag];
+
+		ent->queue = queue;
+		ent->tag = tag;
+		ent->fuse_req = NULL;
+
+		pr_devel("initialize qid=%d tag=%d queue=%p req=%p", qcfg->qid,
+			 tag, queue, ent);
+
+		ent->rreq->flags = 0;
+
+		ent->state = 0;
+		set_bit(FRRS_INIT, &ent->state);
+
+		INIT_LIST_HEAD(&ent->list);
+	}
+
+	queue->configured = 1;
+	ring->nr_queues_ioctl_init++;
+	if (ring->nr_queues_ioctl_init == ring->nr_queues) {
+		pr_devel("ring=%p nr-queues=%zu depth=%zu ioctl ready\n", ring,
+			 ring->nr_queues, ring->queue_depth);
+	}
+
+	return 0;
+}
+
