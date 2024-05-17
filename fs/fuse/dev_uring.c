@@ -120,3 +120,117 @@ void fuse_uring_ring_destruct(struct fuse_ring *ring)
 
 	mutex_destroy(&ring->start_stop_lock);
 }
+
+static inline int fuse_uring_current_nodeid(void)
+{
+	int cpu;
+	const struct cpumask *proc_mask = current->cpus_ptr;
+
+	cpu = cpumask_first(proc_mask);
+
+	return cpu_to_node(cpu);
+}
+
+static char *fuse_uring_alloc_queue_buf(int size, int node)
+{
+	char *buf;
+
+	if (size <= 0) {
+		pr_info("Invalid queue buf size: %d.\n", size);
+		return ERR_PTR(-EINVAL);
+	}
+
+	buf = vmalloc_node_user(size, node);
+	return buf ? buf : ERR_PTR(-ENOMEM);
+}
+
+/**
+ * fuse uring mmap, per ring qeuue.
+ * Userpsace maps a kernel allocated ring/queue buffer. For numa awareness,
+ * userspace needs to run the do the mapping from a core bound thread.
+ */
+int
+fuse_uring_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct fuse_dev *fud = fuse_get_dev(filp);
+	struct fuse_conn *fc;
+	struct fuse_ring *ring;
+	size_t sz = vma->vm_end - vma->vm_start;
+	int ret;
+	struct fuse_uring_mbuf *new_node = NULL;
+	void *buf = NULL;
+	int nodeid;
+
+	if (vma->vm_pgoff << PAGE_SHIFT != FUSE_URING_MMAP_OFF) {
+		pr_debug("Invalid offset, expected %llu got %lu\n",
+			 FUSE_URING_MMAP_OFF, vma->vm_pgoff << PAGE_SHIFT);
+		return -EINVAL;
+	}
+
+	if (!fud)
+		return -ENODEV;
+	fc = fud->fc;
+	ring = fc->ring;
+	if (!ring)
+		return -ENODEV;
+
+	nodeid = ring->numa_aware ? fuse_uring_current_nodeid() : NUMA_NO_NODE;
+
+	/* check if uring is configured and if the requested size matches */
+	if (ring->nr_queues == 0 || ring->queue_depth == 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (sz != ring->queue_buf_size) {
+		ret = -EINVAL;
+		pr_devel("mmap size mismatch, expected %zu got %zu\n",
+			 ring->queue_buf_size, sz);
+		goto out;
+	}
+
+	if (current->nr_cpus_allowed != 1 && ring->numa_aware) {
+		ret = -EINVAL;
+		pr_debug(
+			"Numa awareness, but thread has more than allowed cpu.\n");
+		goto out;
+	}
+
+	buf = fuse_uring_alloc_queue_buf(ring->queue_buf_size, nodeid);
+	if (IS_ERR(buf)) {
+		ret = PTR_ERR(buf);
+		goto out;
+	}
+
+	new_node = kmalloc(sizeof(*new_node), GFP_USER);
+	if (unlikely(new_node == NULL)) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = remap_vmalloc_range(vma, buf, 0);
+	if (ret)
+		goto out;
+
+	mutex_lock(&ring->start_stop_lock);
+	/*
+	 * In this function we do not know the queue the buffer belongs to.
+	 * Later server side will pass the mmaped address, the kernel address
+	 * will be found through the map.
+	 */
+	new_node->kbuf = buf;
+	new_node->ubuf = (void *)vma->vm_start;
+	rb_add(&new_node->rb_node, &ring->mem_buf_map,
+	       fuse_uring_rb_tree_buf_less);
+	mutex_unlock(&ring->start_stop_lock);
+out:
+	if (ret) {
+		kfree(new_node);
+		vfree(buf);
+	}
+
+	pr_devel("%s: pid %d addr: %p sz: %zu  ret: %d\n", __func__,
+		 current->pid, (char *)vma->vm_start, sz, ret);
+
+	return ret;
+}

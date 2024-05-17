@@ -2470,6 +2470,9 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+#if IS_ENABLED(CONFIG_FUSE_IO_URING)
+	.mmap		= fuse_uring_mmap,
+#endif
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 

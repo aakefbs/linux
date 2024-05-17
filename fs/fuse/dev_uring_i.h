@@ -181,6 +181,7 @@ struct fuse_ring {
 
 void fuse_uring_abort_end_requests(struct fuse_ring *ring);
 int fuse_uring_conn_cfg(struct fuse_ring *ring, struct fuse_ring_config *rcfg);
+int fuse_uring_mmap(struct file *filp, struct vm_area_struct *vma);
 int fuse_uring_queue_cfg(struct fuse_ring *ring,
 			 struct fuse_ring_queue_config *qcfg);
 void fuse_uring_ring_destruct(struct fuse_ring *ring);
@@ -206,6 +207,27 @@ static inline void fuse_uring_conn_destruct(struct fuse_conn *fc)
 
 	WRITE_ONCE(fc->ring, NULL);
 	kfree(ring);
+}
+
+static inline int fuse_uring_rb_tree_buf_cmp(const void *key,
+					     const struct rb_node *node)
+{
+	const struct fuse_uring_mbuf *entry =
+		rb_entry(node, struct fuse_uring_mbuf, rb_node);
+
+	if (key == entry->ubuf)
+		return 0;
+
+	return (unsigned long)key < (unsigned long)entry->ubuf ? -1 : 1;
+}
+
+static inline bool fuse_uring_rb_tree_buf_less(struct rb_node *node1,
+					       const struct rb_node *node2)
+{
+	const struct fuse_uring_mbuf *entry1 =
+		rb_entry(node1, struct fuse_uring_mbuf, rb_node);
+
+	return fuse_uring_rb_tree_buf_cmp(entry1->ubuf, node2) < 0;
 }
 
 static inline struct fuse_ring_queue *

@@ -1259,4 +1259,7 @@ struct fuse_supp_groups {
 #define FUSE_RING_HEADER_BUF_SIZE 4096
 #define FUSE_RING_MIN_IN_OUT_ARG_SIZE 4096
 
+/* The offset parameter is used to identify the request type */
+#define FUSE_URING_MMAP_OFF 0xf8000000ULL
+
 #endif /* _LINUX_FUSE_H */
