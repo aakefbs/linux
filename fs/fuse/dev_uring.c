@@ -48,6 +48,44 @@ fuse_uring_async_send_to_ring(struct io_uring_cmd *cmd,
 	io_uring_cmd_done(cmd, 0, 0, issue_flags);
 }
 
+/* Abort all list queued request on the given ring queue */
+static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
+{
+	struct fuse_req *req;
+	LIST_HEAD(sync_list);
+	LIST_HEAD(async_list);
+
+	spin_lock(&queue->lock);
+
+	list_for_each_entry(req, &queue->sync_fuse_req_queue, list)
+		clear_bit(FR_PENDING, &req->flags);
+	list_for_each_entry(req, &queue->async_fuse_req_queue, list)
+		clear_bit(FR_PENDING, &req->flags);
+
+	list_splice_init(&queue->async_fuse_req_queue, &sync_list);
+	list_splice_init(&queue->sync_fuse_req_queue, &async_list);
+
+	spin_unlock(&queue->lock);
+
+	/* must not hold queue lock to avoid order issues with fi->lock */
+	fuse_dev_end_requests(&sync_list);
+	fuse_dev_end_requests(&async_list);
+}
+
+void fuse_uring_abort_end_requests(struct fuse_ring *ring)
+{
+	int qid;
+
+	for (qid = 0; qid < ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(ring, qid);
+
+		if (!queue->configured)
+			continue;
+
+		fuse_uring_abort_end_queue_requests(queue);
+	}
+}
+
 /* Update conn limits according to ring values */
 static void fuse_uring_conn_cfg_limits(struct fuse_ring *ring)
 {
@@ -359,6 +397,162 @@ int fuse_uring_queue_cfg(struct fuse_ring *ring,
 	}
 
 	return 0;
+}
+
+static void fuse_uring_stop_fuse_req_end(struct fuse_ring_ent *ent)
+{
+	struct fuse_req *req = ent->fuse_req;
+
+	ent->fuse_req = NULL;
+	clear_bit(FRRS_FUSE_REQ, &ent->state);
+	clear_bit(FR_SENT, &req->flags);
+	req->out.h.error = -ECONNABORTED;
+	fuse_request_end(req);
+}
+
+/*
+ * Release a request/entry on connection shutdown
+ */
+static bool fuse_uring_try_entry_stop(struct fuse_ring_ent *ent,
+				      bool need_cmd_done)
+	__must_hold(ent->queue->lock)
+{
+	struct fuse_ring_queue *queue = ent->queue;
+	bool released = false;
+
+	if (test_bit(FRRS_FREED, &ent->state))
+		goto out; /* no work left, freed before */
+
+	if (ent->state == BIT(FRRS_INIT) || test_bit(FRRS_WAIT, &ent->state) ||
+	    test_bit(FRRS_USERSPACE, &ent->state)) {
+		set_bit(FRRS_FREED, &ent->state);
+
+		if (need_cmd_done) {
+			pr_devel("qid=%d tag=%d sending cmd_done\n", queue->qid,
+				 ent->tag);
+
+			spin_unlock(&queue->lock);
+			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0,
+					  IO_URING_F_UNLOCKED);
+			spin_lock(&queue->lock);
+		}
+
+		if (ent->fuse_req)
+			fuse_uring_stop_fuse_req_end(ent);
+		released = true;
+	}
+out:
+	return released;
+}
+
+static void fuse_uring_stop_list_entries(struct list_head *head,
+					 struct fuse_ring_queue *queue,
+					 bool need_cmd_done)
+{
+	struct fuse_ring *ring = queue->ring;
+	struct fuse_ring_ent *ent, *next;
+	ssize_t queue_refs = SSIZE_MAX;
+
+	list_for_each_entry_safe(ent, next, head, list) {
+		if (fuse_uring_try_entry_stop(ent, need_cmd_done)) {
+			queue_refs = atomic_dec_return(&ring->queue_refs);
+			list_del_init(&ent->list);
+		}
+
+		if (WARN_ON_ONCE(queue_refs < 0))
+			pr_warn("qid=%d queue_refs=%zd", queue->qid,
+				queue_refs);
+	}
+}
+
+static void fuse_uring_stop_queue(struct fuse_ring_queue *queue)
+	__must_hold(&queue->lock)
+{
+	fuse_uring_stop_list_entries(&queue->ent_in_userspace, queue, false);
+	fuse_uring_stop_list_entries(&queue->async_ent_avail_queue, queue, true);
+	fuse_uring_stop_list_entries(&queue->sync_ent_avail_queue, queue, true);
+}
+
+/*
+ * Log state debug info
+ */
+static void fuse_uring_stop_ent_state(struct fuse_ring *ring)
+{
+	int qid, tag;
+
+	for (qid = 0; qid < ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(ring, qid);
+
+		for (tag = 0; tag < ring->queue_depth; tag++) {
+			struct fuse_ring_ent *ent = &queue->ring_ent[tag];
+
+			if (!test_bit(FRRS_FREED, &ent->state))
+				pr_info("ring=%p qid=%d tag=%d state=%lu\n",
+					ring, qid, tag, ent->state);
+		}
+	}
+	ring->stop_debug_log = 1;
+}
+
+static void fuse_uring_async_stop_queues(struct work_struct *work)
+{
+	int qid;
+	struct fuse_ring *ring =
+		container_of(work, struct fuse_ring, stop_work.work);
+
+	for (qid = 0; qid < ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(ring, qid);
+
+		if (!queue->configured)
+			continue;
+
+		spin_lock(&queue->lock);
+		fuse_uring_stop_queue(queue);
+		spin_unlock(&queue->lock);
+	}
+
+	if (atomic_read(&ring->queue_refs) > 0) {
+		if (time_after(jiffies,
+			       ring->stop_time + FUSE_URING_STOP_WARN_TIMEOUT))
+			fuse_uring_stop_ent_state(ring);
+
+		pr_info("ring=%p scheduling intervalled queue stop\n", ring);
+
+		schedule_delayed_work(&ring->stop_work,
+				      FUSE_URING_STOP_INTERVAL);
+	} else {
+		wake_up_all(&ring->stop_waitq);
+	}
+}
+
+/*
+ * Stop the ring queues
+ */
+void fuse_uring_stop_queues(struct fuse_ring *ring)
+{
+	int qid;
+
+	for (qid = 0; qid < ring->nr_queues; qid++) {
+		struct fuse_ring_queue *queue = fuse_uring_get_queue(ring, qid);
+
+		if (!queue->configured)
+			continue;
+
+		spin_lock(&queue->lock);
+		fuse_uring_stop_queue(queue);
+		spin_unlock(&queue->lock);
+	}
+
+	if (atomic_read(&ring->queue_refs) > 0) {
+		pr_info("ring=%p scheduling intervalled queue stop\n", ring);
+		ring->stop_time = jiffies;
+		INIT_DELAYED_WORK(&ring->stop_work,
+				  fuse_uring_async_stop_queues);
+		schedule_delayed_work(&ring->stop_work,
+				      FUSE_URING_STOP_INTERVAL);
+	} else {
+		wake_up_all(&ring->stop_waitq);
+	}
 }
 
 /*
