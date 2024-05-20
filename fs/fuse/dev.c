@@ -333,7 +333,10 @@ void fuse_request_end(struct fuse_req *req)
 		spin_unlock(&fc->bg_lock);
 	} else {
 		/* Wake up waiter sleeping in request_wait_answer() */
-		wake_up(&req->waitq);
+		if (fuse_per_core_queue(fc))
+			__wake_up_on_current_cpu(&req->waitq, TASK_NORMAL, NULL);
+		else
+			wake_up(&req->waitq);
 	}
 
 	if (test_bit(FR_ASYNC, &req->flags))
