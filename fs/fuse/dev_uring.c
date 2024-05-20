@@ -32,8 +32,7 @@
 #include <linux/io_uring/cmd.h>
 
 static void fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent,
-					    bool set_err, int error,
-					    unsigned int issue_flags);
+					    bool set_err, int error);
 
 static void fuse_ring_ring_ent_unset_userspace(struct fuse_ring_ent *ent)
 {
@@ -683,8 +682,7 @@ static int fuse_uring_copy_to_ring(struct fuse_ring *ring, struct fuse_req *req,
  * userspace will read it
  * This is comparable with classical read(/dev/fuse)
  */
-static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
-				    unsigned int issue_flags, bool send_in_task)
+static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent)
 {
 	struct fuse_ring *ring = ring_ent->queue->ring;
 	struct fuse_ring_req *rreq = ring_ent->rreq;
@@ -721,20 +719,17 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
 	rreq->in = req->in.h;
 	set_bit(FR_SENT, &req->flags);
 
-	pr_devel("%s qid=%d tag=%d state=%lu cmd-done op=%d unique=%llu issue_flags=%u\n",
+	pr_devel("%s qid=%d tag=%d state=%lu cmd-done op=%d unique=%llu\n",
 		 __func__, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
-		 rreq->in.opcode, rreq->in.unique, issue_flags);
+		 rreq->in.opcode, rreq->in.unique);
 
-	if (send_in_task)
-		io_uring_cmd_complete_in_task(ring_ent->cmd,
-					      fuse_uring_async_send_to_ring);
-	else
-		io_uring_cmd_done(ring_ent->cmd, 0, 0, issue_flags);
+	io_uring_cmd_complete_in_task(ring_ent->cmd,
+				      fuse_uring_async_send_to_ring);
 
 	return;
 
 err:
-	fuse_uring_req_end_and_get_next(ring_ent, true, err, issue_flags);
+	fuse_uring_req_end_and_get_next(ring_ent, true, err);
 }
 
 /*
@@ -811,8 +806,7 @@ static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent)
  * has lock/unlock/lock to avoid holding the lock on calling fuse_request_end
  */
 static void fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent,
-					    bool set_err, int error,
-					    unsigned int issue_flags)
+					    bool set_err, int error)
 {
 	struct fuse_req *req = ring_ent->fuse_req;
 	int has_next;
@@ -828,7 +822,7 @@ static void fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent,
 	has_next = fuse_uring_ent_release_and_fetch(ring_ent);
 	if (has_next) {
 		/* called within uring context - use provided flags */
-		fuse_uring_send_to_ring(ring_ent, issue_flags, false);
+		fuse_uring_send_to_ring(ring_ent);
 	}
 }
 
@@ -863,7 +857,7 @@ static void fuse_uring_commit_and_release(struct fuse_dev *fud,
 out:
 	pr_devel("%s:%d ret=%zd op=%d req-ret=%d\n", __func__, __LINE__, err,
 		 req->args->opcode, req->out.h.error);
-	fuse_uring_req_end_and_get_next(ring_ent, set_err, err, issue_flags);
+	fuse_uring_req_end_and_get_next(ring_ent, set_err, err);
 }
 
 /*
@@ -1099,5 +1093,71 @@ out:
 err_unlock:
 	spin_unlock(&queue->lock);
 	goto out;
+}
+
+int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
+{
+	struct fuse_ring *ring = fc->ring;
+	struct fuse_ring_queue *queue;
+	int qid = 0;
+	struct fuse_ring_ent *ring_ent = NULL;
+	int res;
+	bool async = test_bit(FR_BACKGROUND, &req->flags);
+	struct list_head *req_queue, *ent_queue;
+
+	if (ring->per_core_queue) {
+		/*
+		 * async requests are best handled on another core, the current
+		 * core can do application/page handling, while the async request
+		 * is handled on another core in userspace.
+		 * For sync request the application has to wait - no processing, so
+		 * the request should continue on the current core and avoid context
+		 * switches.
+		 * XXX This should be on the same numa node and not busy - is there
+		 * a scheduler function available  that could make this decision?
+		 * It should also not persistently switch between cores - makes
+		 * it hard for the scheduler.
+		 */
+		qid = task_cpu(current);
+
+		if (unlikely(qid >= ring->nr_queues)) {
+			WARN_ONCE(1,
+				  "Core number (%u) exceeds nr ueues (%zu)\n",
+				  qid, ring->nr_queues);
+			qid = 0;
+		}
+	}
+
+	queue = fuse_uring_get_queue(ring, qid);
+	req_queue = async ? &queue->async_fuse_req_queue :
+			    &queue->sync_fuse_req_queue;
+	ent_queue = async ? &queue->async_ent_avail_queue :
+			    &queue->sync_ent_avail_queue;
+
+	spin_lock(&queue->lock);
+
+	if (unlikely(queue->stopped)) {
+		res = -ENOTCONN;
+		goto err_unlock;
+	}
+
+	if (list_empty(ent_queue)) {
+		list_add_tail(&req->list, req_queue);
+	} else {
+		ring_ent =
+			list_first_entry(ent_queue, struct fuse_ring_ent, list);
+		list_del(&ring_ent->list);
+		fuse_uring_add_req_to_ring_ent(ring_ent, req);
+	}
+	spin_unlock(&queue->lock);
+
+	if (ring_ent != NULL)
+		fuse_uring_send_to_ring(ring_ent);
+
+	return 0;
+
+err_unlock:
+	spin_unlock(&queue->lock);
+	return res;
 }
 
