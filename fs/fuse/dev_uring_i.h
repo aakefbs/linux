@@ -261,6 +261,14 @@ fuse_uring_get_queue(struct fuse_ring *ring, int qid)
 	return (struct fuse_ring_queue *)(ptr + qid * ring->queue_size);
 }
 
+static inline bool fuse_uring_configured(struct fuse_conn *fc)
+{
+	if (READ_ONCE(fc->ring) != NULL && fc->ring->configured)
+		return true;
+
+	return false;
+}
+
 #else /* CONFIG_FUSE_IO_URING */
 
 struct fuse_ring;
@@ -272,6 +280,11 @@ static inline void fuse_uring_conn_init(struct fuse_ring *ring,
 
 static inline void fuse_uring_conn_destruct(struct fuse_conn *fc)
 {
+}
+
+static inline bool fuse_uring_configured(struct fuse_conn *fc)
+{
+	return false;
 }
 
 #endif /* CONFIG_FUSE_IO_URING */
