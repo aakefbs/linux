@@ -203,6 +203,7 @@ int fuse_uring_mmap(struct file *filp, struct vm_area_struct *vma);
 int fuse_uring_queue_cfg(struct fuse_ring *ring,
 			 struct fuse_ring_queue_config *qcfg);
 void fuse_uring_ring_destruct(struct fuse_ring *ring);
+int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags);
 
 static inline void fuse_uring_conn_init(struct fuse_ring *ring,
 					struct fuse_conn *fc)
@@ -269,6 +270,11 @@ static inline bool fuse_uring_configured(struct fuse_conn *fc)
 	return false;
 }
 
+static inline bool fuse_per_core_queue(struct fuse_conn *fc)
+{
+	return fc->ring && fc->ring->per_core_queue;
+}
+
 #else /* CONFIG_FUSE_IO_URING */
 
 struct fuse_ring;
@@ -286,6 +292,12 @@ static inline bool fuse_uring_configured(struct fuse_conn *fc)
 {
 	return false;
 }
+
+static inline bool fuse_per_core_queue(struct fuse_conn *fc)
+{
+	return false;
+}
+
 
 #endif /* CONFIG_FUSE_IO_URING */
 

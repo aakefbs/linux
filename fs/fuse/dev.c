@@ -2510,6 +2510,7 @@ const struct file_operations fuse_dev_operations = {
 	.compat_ioctl   = compat_ptr_ioctl,
 #if IS_ENABLED(CONFIG_FUSE_IO_URING)
 	.mmap		= fuse_uring_mmap,
+	.uring_cmd	= fuse_uring_cmd,
 #endif
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);

@@ -1262,6 +1262,12 @@ struct fuse_supp_groups {
 /* The offset parameter is used to identify the request type */
 #define FUSE_URING_MMAP_OFF 0xf8000000ULL
 
+/*
+ * Request is background type. Daemon side is free to use this information
+ * to handle foreground/background CQEs with different priorities.
+ */
+#define FUSE_RING_REQ_FLAG_ASYNC (1ull << 0)
+
 /**
  * This structure mapped onto the
  */
@@ -1286,6 +1292,33 @@ struct fuse_ring_req {
 	};
 
 	char in_out_arg[];
+};
+
+/**
+ * sqe commands to the kernel
+ */
+enum fuse_uring_cmd {
+	FUSE_URING_REQ_INVALID = 0,
+
+	/* submit sqe to kernel to get a request */
+	FUSE_URING_REQ_FETCH = 1,
+
+	/* commit result and fetch next request */
+	FUSE_URING_REQ_COMMIT_AND_FETCH = 2,
+};
+
+/**
+ * In the 80B command area of the SQE.
+ */
+struct fuse_uring_cmd_req {
+	/* queue the command is for (queue index) */
+	uint16_t qid;
+
+	/* queue entry (array index) */
+	uint16_t tag;
+
+	/* pointer to struct fuse_uring_buf_req */
+	uint32_t flags;
 };
 
 #endif /* _LINUX_FUSE_H */

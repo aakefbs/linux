@@ -31,6 +31,27 @@
 #include <linux/topology.h>
 #include <linux/io_uring/cmd.h>
 
+static void fuse_ring_ring_ent_unset_userspace(struct fuse_ring_ent *ent)
+{
+	clear_bit(FRRS_USERSPACE, &ent->state);
+	list_del_init(&ent->list);
+}
+
+/* Update conn limits according to ring values */
+static void fuse_uring_conn_cfg_limits(struct fuse_ring *ring)
+{
+	struct fuse_conn *fc = ring->fc;
+
+	WRITE_ONCE(fc->max_pages, min_t(unsigned int, fc->max_pages,
+					ring->req_arg_len / PAGE_SIZE));
+
+	/* This not ideal, as multiplication with nr_queue assumes the limit
+	 * gets reached when all queues are used, but a single threaded
+	 * application might already do that.
+	 */
+	WRITE_ONCE(fc->max_background, ring->nr_queues * ring->max_nr_async);
+}
+
 /*
  * Basic ring setup for this connection based on the provided configuration
  */
@@ -327,5 +348,251 @@ int fuse_uring_queue_cfg(struct fuse_ring *ring,
 	}
 
 	return 0;
+}
+
+/*
+ * Put a ring request onto hold, it is no longer used for now.
+ */
+static void fuse_uring_ent_avail(struct fuse_ring_ent *ring_ent,
+				 struct fuse_ring_queue *queue)
+	__must_hold(&queue->lock)
+{
+	struct fuse_ring *ring = queue->ring;
+
+	/* unsets all previous flags - basically resets */
+	pr_devel("%s ring=%p qid=%d tag=%d state=%lu async=%d\n", __func__,
+		 ring, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
+		 ring_ent->async);
+
+	if (WARN_ON(test_bit(FRRS_USERSPACE, &ring_ent->state))) {
+		pr_warn("%s qid=%d tag=%d state=%lu async=%d\n", __func__,
+			ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
+			ring_ent->async);
+		return;
+	}
+
+	WARN_ON_ONCE(!list_empty(&ring_ent->list));
+
+	if (ring_ent->async)
+		list_add(&ring_ent->list, &queue->async_ent_avail_queue);
+	else
+		list_add(&ring_ent->list, &queue->sync_ent_avail_queue);
+
+	set_bit(FRRS_WAIT, &ring_ent->state);
+}
+
+/*
+ * fuse_uring_req_fetch command handling
+ */
+static int fuse_uring_fetch(struct fuse_ring_ent *ring_ent,
+			    struct io_uring_cmd *cmd, unsigned int issue_flags)
+__must_hold(ring_ent->queue->lock)
+{
+	struct fuse_ring_queue *queue = ring_ent->queue;
+	struct fuse_ring *ring = queue->ring;
+	int ret = 0;
+	int nr_ring_sqe;
+
+	/* register requests for foreground requests first, then backgrounds */
+	if (queue->nr_req_sync >= ring->max_nr_sync) {
+		queue->nr_req_async++;
+		ring_ent->async = 1;
+	} else
+		queue->nr_req_sync++;
+
+	fuse_uring_ent_avail(ring_ent, queue);
+
+	if (queue->nr_req_sync + queue->nr_req_async > ring->queue_depth) {
+		/* should be caught by ring state before and queue depth
+		 * check before
+		 */
+		WARN_ON(1);
+		pr_info("qid=%d tag=%d req cnt (fg=%d async=%d exceeds depth=%zu",
+			queue->qid, ring_ent->tag, queue->nr_req_sync,
+			queue->nr_req_async, ring->queue_depth);
+		ret = -ERANGE;
+	}
+
+	if (ret)
+		goto out; /* erange */
+
+	WRITE_ONCE(ring_ent->cmd, cmd);
+
+	nr_ring_sqe = ring->queue_depth * ring->nr_queues;
+	if (atomic_inc_return(&ring->nr_sqe_init) == nr_ring_sqe) {
+		fuse_uring_conn_cfg_limits(ring);
+		ring->ready = 1;
+	}
+
+out:
+	return ret;
+}
+
+static struct fuse_ring_queue *
+fuse_uring_get_verify_queue(struct fuse_ring *ring,
+			    const struct fuse_uring_cmd_req *cmd_req,
+			    unsigned int issue_flags)
+{
+	struct fuse_conn *fc = ring->fc;
+	struct fuse_ring_queue *queue;
+	int ret;
+
+	if (!(issue_flags & IO_URING_F_SQE128)) {
+		pr_info("qid=%d tag=%d SQE128 not set\n", cmd_req->qid,
+			cmd_req->tag);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	if (unlikely(!fc->connected)) {
+		ret = -ENOTCONN;
+		goto err;
+	}
+
+	if (unlikely(!ring->configured)) {
+		pr_info("command for a connection that is not ring configured\n");
+		ret = -ENODEV;
+		goto err;
+	}
+
+	if (unlikely(cmd_req->qid >= ring->nr_queues)) {
+		pr_devel("qid=%u >= nr-queues=%zu\n", cmd_req->qid,
+			 ring->nr_queues);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	queue = fuse_uring_get_queue(ring, cmd_req->qid);
+	if (unlikely(queue == NULL)) {
+		pr_info("Got NULL queue for qid=%d\n", cmd_req->qid);
+		ret = -EIO;
+		goto err;
+	}
+
+	if (unlikely(!queue->configured || queue->stopped)) {
+		pr_info("Ring or queue (qid=%u) not ready.\n", cmd_req->qid);
+		ret = -ENOTCONN;
+		goto err;
+	}
+
+	if (cmd_req->tag > ring->queue_depth) {
+		pr_info("tag=%u > queue-depth=%zu\n", cmd_req->tag,
+			ring->queue_depth);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	return queue;
+
+err:
+	return ERR_PTR(ret);
+}
+
+/**
+ * Entry function from io_uring to handle the given passthrough command
+ * (op cocde IORING_OP_URING_CMD)
+ */
+int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
+{
+	const struct fuse_uring_cmd_req *cmd_req = io_uring_sqe_cmd(cmd->sqe);
+	struct fuse_dev *fud = fuse_get_dev(cmd->file);
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_ring *ring = fc->ring;
+	struct fuse_ring_queue *queue;
+	struct fuse_ring_ent *ring_ent = NULL;
+	u32 cmd_op = cmd->cmd_op;
+	int ret = 0;
+
+	if (!ring) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	queue = fuse_uring_get_verify_queue(ring, cmd_req, issue_flags);
+	if (IS_ERR(queue)) {
+		ret = PTR_ERR(queue);
+		goto out;
+	}
+
+	ring_ent = &queue->ring_ent[cmd_req->tag];
+
+	pr_devel("%s:%d received: cmd op %d qid %d (%p) tag %d  (%p)\n",
+		 __func__, __LINE__, cmd_op, cmd_req->qid, queue, cmd_req->tag,
+		 ring_ent);
+
+	spin_lock(&queue->lock);
+	if (unlikely(queue->stopped)) {
+		/* XXX how to ensure queue still exists? Add
+		 * an rw ring->stop lock? And take that at the beginning
+		 * of this function? Better would be to advise uring
+		 * not to call this function at all? Or free the queue memory
+		 * only, on daemon PF_EXITING?
+		 */
+		ret = -ENOTCONN;
+		goto err_unlock;
+	}
+
+	if (current == queue->server_task)
+		queue->uring_cmd_issue_flags = issue_flags;
+
+	switch (cmd_op) {
+	case FUSE_URING_REQ_FETCH:
+		if (queue->server_task == NULL) {
+			queue->server_task = current;
+			queue->uring_cmd_issue_flags = issue_flags;
+		}
+
+		/* No other bit must be set here */
+		if (ring_ent->state != BIT(FRRS_INIT)) {
+			pr_info_ratelimited(
+				"qid=%d tag=%d register req state %lu expected %lu",
+				cmd_req->qid, cmd_req->tag, ring_ent->state,
+				BIT(FRRS_INIT));
+			ret = -EINVAL;
+			goto err_unlock;
+		}
+
+		fuse_ring_ring_ent_unset_userspace(ring_ent);
+
+		ret = fuse_uring_fetch(ring_ent, cmd, issue_flags);
+		if (ret)
+			goto err_unlock;
+
+		/*
+		 * The ring entry is registered now and needs to be handled
+		 * for shutdown.
+		 */
+		atomic_inc(&ring->queue_refs);
+
+		spin_unlock(&queue->lock);
+		break;
+	default:
+		ret = -EINVAL;
+		pr_devel("Unknown uring command %d", cmd_op);
+		goto err_unlock;
+	}
+out:
+	pr_devel("uring cmd op=%d, qid=%d tag=%d ret=%d\n", cmd_op,
+		 cmd_req->qid, cmd_req->tag, ret);
+
+	if (ret < 0) {
+		if (ring_ent != NULL) {
+			pr_info_ratelimited("error: uring cmd op=%d, qid=%d tag=%d ret=%d\n",
+					    cmd_op, cmd_req->qid, cmd_req->tag,
+					    ret);
+
+			/* must not change the entry state, as userspace
+			 * might have sent random data, but valid requests
+			 * might be registered already - don't confuse those.
+			 */
+		}
+		io_uring_cmd_done(cmd, ret, 0, issue_flags);
+	}
+
+	return -EIOCBQUEUED;
+
+err_unlock:
+	spin_unlock(&queue->lock);
+	goto out;
 }
 
