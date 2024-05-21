@@ -13,6 +13,14 @@
 
 #ifdef CONFIG_FUSE_IO_URING
 
+/**
+ * Minimal async size with uring communication. Async is handled on a different
+ * core and that has overhead, so the async queue is only used beginning
+ * with a certain size - XXX should this be a tunable parameter?
+ */
+#define FUSE_URING_MIN_ASYNC_SIZE (16384)
+
+
 /* IORING_MAX_ENTRIES */
 #define FUSE_URING_MAX_QUEUE_DEPTH 32768
 
