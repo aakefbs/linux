@@ -11,6 +11,13 @@
 #include "linux/compiler_types.h"
 #include "linux/rbtree_types.h"
 
+/**
+ * Minimal async size with uring communication. Async is handled on a different
+ * core and that has overhead, so the async queue is only used beginning
+ * with a certain size - XXX should this be a tunable parameter?
+ */
+#define FUSE_URING_MIN_ASYNC_SIZE (16384)
+
 #if IS_ENABLED(CONFIG_FUSE_IO_URING)
 
 /* IORING_MAX_ENTRIES */

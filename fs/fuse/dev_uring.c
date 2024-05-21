@@ -1095,18 +1095,33 @@ err_unlock:
 	goto out;
 }
 
-int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
+static int fuse_uring_get_req_qid(struct fuse_req *req, struct fuse_ring *ring,
+				  bool async)
 {
-	struct fuse_ring *ring = fc->ring;
-	struct fuse_ring_queue *queue;
-	int qid = 0;
-	struct fuse_ring_ent *ring_ent = NULL;
-	int res;
-	bool async = test_bit(FR_BACKGROUND, &req->flags);
-	struct list_head *req_queue, *ent_queue;
+	int cpu_off = 0;
+	size_t req_size = 0;
+	int qid;
 
-	if (ring->per_core_queue) {
-		int cpu_off;
+	if (!ring->per_core_queue)
+		return 0;
+
+	/*
+	 * async has on a different core (see below) introduces context
+	 * switching - should be avoided for small requests
+	 */
+	if (async) {
+		switch (req->args->opcode) {
+		case FUSE_READ:
+			req_size = req->args->out_args[0].size;
+			break;
+		case FUSE_WRITE:
+			req_size = req->args->in_args[1].size;
+			break;
+		default:
+			/* anything else, <= 4K */
+			req_size = 0;
+			break;
+		}
 
 		/*
 		 * async requests are best handled on another core, the current
@@ -1120,17 +1135,33 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 		 * It should also not persistently switch between cores - makes
 		 * it hard for the scheduler.
 		 */
-		cpu_off = async ? 1 : 0;
-		qid = (task_cpu(current) + cpu_off) % ring->nr_queues;
-
-		if (unlikely(qid >= ring->nr_queues)) {
-			WARN_ONCE(1,
-				  "Core number (%u) exceeds nr ueues (%zu)\n",
-				  qid, ring->nr_queues);
-			qid = 0;
-		}
+		if (req_size > FUSE_URING_MIN_ASYNC_SIZE)
+			cpu_off = 1;
 	}
 
+	qid = (task_cpu(current) + cpu_off) % ring->nr_queues;
+
+	if (unlikely(qid >= ring->nr_queues)) {
+		WARN_ONCE(1, "Core number (%u) exceeds nr queues (%zu)\n",
+			  qid, ring->nr_queues);
+		qid = 0;
+	}
+
+	return qid;
+}
+
+int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
+{
+	struct fuse_ring *ring = fc->ring;
+	struct fuse_ring_queue *queue;
+	struct fuse_ring_ent *ring_ent = NULL;
+	int res;
+	int async = test_bit(FR_BACKGROUND, &req->flags) &&
+		    !req->args->async_blocking;
+	struct list_head *ent_queue, *req_queue;
+	int qid;
+
+	qid = fuse_uring_get_req_qid(req, ring, async);
 	queue = fuse_uring_get_queue(ring, qid);
 	req_queue = async ? &queue->async_fuse_req_queue :
 			    &queue->sync_fuse_req_queue;
