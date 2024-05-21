@@ -1106,6 +1106,8 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	struct list_head *req_queue, *ent_queue;
 
 	if (ring->per_core_queue) {
+		int cpu_off;
+
 		/*
 		 * async requests are best handled on another core, the current
 		 * core can do application/page handling, while the async request
@@ -1118,7 +1120,8 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 		 * It should also not persistently switch between cores - makes
 		 * it hard for the scheduler.
 		 */
-		qid = task_cpu(current);
+		cpu_off = async ? 1 : 0;
+		qid = (task_cpu(current) + cpu_off) % ring->nr_queues;
 
 		if (unlikely(qid >= ring->nr_queues)) {
 			WARN_ONCE(1,
