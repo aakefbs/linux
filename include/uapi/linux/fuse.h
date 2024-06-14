@@ -1288,7 +1288,6 @@ struct fuse_ring_req {
 		struct {
 			uint64_t flags;
 
-			/* enum fuse_ring_buf_cmd */
 			uint32_t in_out_arg_len;
 			uint32_t padding;
 
@@ -1320,14 +1319,19 @@ enum fuse_uring_cmd {
  * In the 80B command area of the SQE.
  */
 struct fuse_uring_cmd_req {
+	uint64_t buf_ptr;
+
+	uint32_t buf_len;
+
 	/* queue the command is for (queue index) */
 	uint16_t qid;
 
 	/* queue entry (array index) */
 	uint16_t tag;
 
-	/* pointer to struct fuse_uring_buf_req */
 	uint32_t flags;
+
+	uint32_t in_out_arg_len;
 };
 
 #endif /* _LINUX_FUSE_H */

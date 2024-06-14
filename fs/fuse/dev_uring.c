@@ -30,6 +30,12 @@
 #include <linux/io_uring/cmd.h>
 #include <linux/topology.h>
 #include <linux/io_uring/cmd.h>
+#include <linux/vmalloc.h>
+
+struct fuse_uring_cmd_pdu
+{
+	struct fuse_ring_ent *ring_ent;
+};
 
 static void fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent,
 					    bool set_err, int error,
@@ -237,7 +243,7 @@ __must_hold(ring->start_stop_lock)
 {
 	struct rb_node *node;
 	struct fuse_uring_mbuf *entry;
-	int tag;
+//	int tag;
 
 	node = rb_find((const void *)uaddr, &ring->mem_buf_map,
 		       fuse_uring_rb_tree_buf_cmp);
@@ -249,11 +255,13 @@ __must_hold(ring->start_stop_lock)
 
 	queue->queue_req_buf = entry->kbuf;
 
+#if 0
 	for (tag = 0; tag < ring->queue_depth; tag++) {
 		struct fuse_ring_ent *ent = &queue->ring_ent[tag];
 
 		ent->rreq = entry->kbuf + tag * ring->req_buf_sz;
 	}
+#endif
 
 	kfree(node);
 	return 0;
@@ -385,7 +393,7 @@ int fuse_uring_queue_cfg(struct fuse_ring *ring,
 		pr_devel("initialize qid=%d tag=%d queue=%p req=%p", qcfg->qid,
 			 tag, queue, ent);
 
-		ent->rreq->flags = 0;
+		// ent->rreq->flags = 0;
 
 		ent->state = 0;
 		set_bit(FRRS_INIT, &ent->state);
@@ -562,12 +570,10 @@ void fuse_uring_stop_queues(struct fuse_ring *ring)
 /*
  * Checks for errors and stores it into the request
  */
-static int fuse_uring_ring_ent_has_err(struct fuse_ring *ring,
-				       struct fuse_ring_ent *ring_ent)
+static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
+					 struct fuse_req *req,
+					 struct fuse_conn *fc)
 {
-	struct fuse_conn *fc = ring->fc;
-	struct fuse_req *req = ring_ent->fuse_req;
-	struct fuse_out_header *oh = &req->out.h;
 	int err;
 
 	if (oh->unique == 0) {
@@ -630,72 +636,82 @@ err:
  */
 static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 				     struct fuse_req *req,
-				     struct fuse_ring_req *rreq)
+				     struct fuse_ring_ent *ent)
 {
+	struct fuse_ring_req __user *rreq = ent->rreq;
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
+	struct iov_iter iter;
+	int err;
+	int res_arg_len;
 
-	fuse_copy_init(&cs, 0, NULL);
+	err = copy_from_user(&res_arg_len, &rreq->in_out_arg_len,
+			     sizeof(res_arg_len));
+	if (err)
+		return err;
+
+	err = import_ubuf(ITER_SOURCE, (void __user *)&rreq->in_out_arg,
+			  ent->max_arg_len, &iter);
+	if (err)
+		return err;
+
+	fuse_copy_init(&cs, 0, &iter);
 	cs.is_uring = 1;
-	cs.ring.buf = rreq->in_out_arg;
-
-	if (rreq->in_out_arg_len > ring->req_arg_len) {
-		pr_devel("Max ring buffer len exceeded (%u vs %zu\n",
-			 rreq->in_out_arg_len, ring->req_arg_len);
-		return -EINVAL;
-	}
-	cs.ring.buf_sz = rreq->in_out_arg_len;
 	cs.req = req;
 
 	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
 		 cs.ring.buf, cs.ring.buf_sz, args->out_numargs);
 
-	return fuse_copy_out_args(&cs, args, rreq->in_out_arg_len);
+	return fuse_copy_out_args(&cs, args, res_arg_len);
 }
 
 /*
  * Copy data from the req to the ring buffer
  */
 static int fuse_uring_copy_to_ring(struct fuse_ring *ring, struct fuse_req *req,
-				   struct fuse_ring_req *rreq)
+				   struct fuse_ring_ent *ent)
 {
+	struct fuse_ring_req __user *rreq = ent->rreq;
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
-	int err;
+	int err, res;
+	struct iov_iter iter;
 
-	fuse_copy_init(&cs, 1, NULL);
+	err = import_ubuf(ITER_DEST, (void __user *)&rreq->in_out_arg,
+			  ent->max_arg_len, &iter);
+	if (err) {
+		pr_info("Import user buffer failed\n");
+		return err;
+	}
+
+	fuse_copy_init(&cs, 1, &iter);
 	cs.is_uring = 1;
-	cs.ring.buf = rreq->in_out_arg;
-	cs.ring.buf_sz = ring->req_arg_len;
 	cs.req = req;
-
-	pr_devel("%s:%d buf=%p len=%d args=%d\n", __func__, __LINE__,
-		 cs.ring.buf, cs.ring.buf_sz, args->out_numargs);
+	cs.ring.buf_sz = ring->req_arg_len;
 
 	err = fuse_copy_args(&cs, args->in_numargs, args->in_pages,
 			     (struct fuse_arg *)args->in_args, 0);
-	rreq->in_out_arg_len = cs.ring.offset;
+	if (err) {
+		pr_info("%s fuse_copy_args failed\n", __func__);
+		return err;
+	}
 
-	pr_devel("%s:%d buf=%p len=%d args=%d err=%d\n", __func__, __LINE__,
-		 cs.ring.buf, cs.ring.buf_sz, args->out_numargs, err);
+	BUILD_BUG_ON((sizeof(rreq->in_out_arg_len) != sizeof(cs.ring.offset)));
+	res = copy_to_user(&rreq->in_out_arg_len, &cs.ring.offset,
+			   sizeof(rreq->in_out_arg_len));
+	err = res > 0 ? -EFAULT : res;
 
 	return err;
 }
 
-/*
- * Write data to the ring buffer and send the request to userspace,
- * userspace will read it
- * This is comparable with classical read(/dev/fuse)
- */
-static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
-				    unsigned int issue_flags,
-				    bool send_in_task)
+static int
+fuse_uring_prepare_send(struct fuse_ring_ent *ring_ent)
 {
-	struct fuse_ring *ring = ring_ent->queue->ring;
 	struct fuse_ring_req *rreq = ring_ent->rreq;
-	struct fuse_req *req = ring_ent->fuse_req;
 	struct fuse_ring_queue *queue = ring_ent->queue;
-	int err = 0;
+	struct fuse_ring *ring = queue->ring;
+	struct fuse_req *req = ring_ent->fuse_req;
+	int err = 0, res;
 
 	spin_lock(&queue->lock);
 
@@ -714,8 +730,13 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
 	if (err)
 		goto err;
 
-	err = fuse_uring_copy_to_ring(ring, req, rreq);
+	pr_devel("%s qid=%d tag=%d state=%lu cmd-done op=%d unique=%llu\n",
+		 __func__, queue->qid, ring_ent->tag, ring_ent->state,
+		 req->in.h.opcode, req->in.h.unique);
+
+	err = fuse_uring_copy_to_ring(ring, req, ring_ent);
 	if (unlikely(err)) {
+		pr_info("Copy to ring failed: %d\n", err);
 		spin_lock(&queue->lock);
 		fuse_ring_ring_ent_unset_userspace(ring_ent);
 		spin_unlock(&queue->lock);
@@ -723,14 +744,34 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
 	}
 
 	/* ring req go directly into the shared memory buffer */
-	rreq->in = req->in.h;
+	res = copy_to_user(&rreq->in, &req->in.h, sizeof(rreq->in));
+	err = res > 0 ? -EFAULT : res;
+	if (err)
+		goto err;
+
 	set_bit(FR_SENT, &req->flags);
+	return 0;
 
-	pr_devel("%s qid=%d tag=%d state=%lu cmd-done op=%d unique=%llu\n",
-		 __func__, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
-		 rreq->in.opcode, rreq->in.unique);
+err:
+	return err;
+}
 
-	if (send_in_task)
+/*
+ * Write data to the ring buffer and send the request to userspace,
+ * userspace will read it
+ * This is comparable with classical read(/dev/fuse)
+ */
+static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
+				    unsigned int issue_flags,
+				    bool send_in_task)
+{
+	int err = 0;
+
+	err = fuse_uring_prepare_send(ring_ent);
+	if (err)
+		goto err;
+
+	if (send_in_task || 1)
 		io_uring_cmd_complete_in_task(ring_ent->cmd,
 					      fuse_uring_async_send_to_ring);
 	else
@@ -851,9 +892,13 @@ static void fuse_uring_commit_and_release(struct fuse_dev *fud,
 	ssize_t err = 0;
 	bool set_err = false;
 
-	req->out.h = rreq->out;
+	err = copy_from_user(&req->out.h, &rreq->out, sizeof(req->out.h));
+	if (err) {
+		req->out.h.error = err;
+		goto out;
+	}
 
-	err = fuse_uring_ring_ent_has_err(fud->fc->ring, ring_ent);
+	err = fuse_uring_out_header_has_err(&req->out.h, req, fud->fc);
 	if (err) {
 		/* req->out.h.error already set */
 		pr_devel("%s:%d err=%zd oh->err=%d\n", __func__, __LINE__, err,
@@ -861,7 +906,7 @@ static void fuse_uring_commit_and_release(struct fuse_dev *fud,
 		goto out;
 	}
 
-	err = fuse_uring_copy_from_ring(fud->fc->ring, req, rreq);
+	err = fuse_uring_copy_from_ring(fud->fc->ring, req, ring_ent);
 	if (err)
 		set_err = true;
 
@@ -1025,6 +1070,16 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	if (current == queue->server_task)
 		queue->uring_cmd_issue_flags = issue_flags;
 
+	ring_ent->rreq = (void __user *)cmd_req->buf_ptr;
+	ring_ent->max_arg_len = cmd_req->buf_len -
+				offsetof(struct fuse_ring_req, in_out_arg);
+	if (cmd_req->buf_len < ring->req_buf_sz) {
+		pr_info("Invalid req buf len, expected: %zd got %d\n",
+			ring->req_buf_sz, cmd_req->buf_len);
+		ret = -EINVAL;
+		goto err_unlock;
+	}
+
 	switch (cmd_op) {
 	case FUSE_URING_REQ_FETCH:
 		if (queue->server_task == NULL) {
@@ -1069,9 +1124,9 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 		}
 
 		fuse_ring_ring_ent_unset_userspace(ring_ent);
-		spin_unlock(&queue->lock);
 
-		WRITE_ONCE(ring_ent->cmd, cmd);
+		ring_ent->cmd = cmd;
+		spin_unlock(&queue->lock);
 		fuse_uring_commit_and_release(fud, ring_ent, issue_flags);
 
 		ret = 0;
@@ -1161,6 +1216,27 @@ static int fuse_uring_get_req_qid(struct fuse_req *req, struct fuse_ring *ring,
 	return qid;
 }
 
+static void
+fuse_uring_send_req_in_task(struct io_uring_cmd *cmd,
+			    unsigned int issue_flags)
+{
+	struct fuse_uring_cmd_pdu *pdu = (struct fuse_uring_cmd_pdu *)cmd->pdu;
+	struct fuse_ring_ent *ring_ent = pdu->ring_ent;
+	BUILD_BUG_ON(sizeof(pdu) > sizeof(cmd->pdu));
+	int err;
+
+	err = fuse_uring_prepare_send(ring_ent);
+	if (err)
+		goto err;
+
+	io_uring_cmd_done(cmd, 0, 0, issue_flags);
+
+	return;
+
+err:
+	fuse_uring_req_end_and_get_next(ring_ent, true, err, issue_flags);
+}
+
 int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 {
 	struct fuse_ring *ring = fc->ring;
@@ -1171,8 +1247,8 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	int async = async_req && !req->args->async_blocking;
 	struct list_head *ent_queue, *req_queue;
 	int qid;
-	bool send_in_task;
-	unsigned int issue_flags;
+	bool send_in_task = true;
+	unsigned int issue_flags = 0;
 
 	qid = fuse_uring_get_req_qid(req, ring, async);
 	queue = fuse_uring_get_queue(ring, qid);
@@ -1188,44 +1264,28 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 		goto err_unlock;
 	}
 
-	if (list_empty(ent_queue)) {
-		list_add_tail(&req->list, req_queue);
-	} else {
+	list_add_tail(&req->list, req_queue);
+
+	if (!list_empty(ent_queue)) {
 		ring_ent =
 			list_first_entry(ent_queue, struct fuse_ring_ent, list);
-		list_del(&ring_ent->list);
+		list_del_init(&ring_ent->list);
 		fuse_uring_add_req_to_ring_ent(ring_ent, req);
 		if (current == queue->server_task) {
 			issue_flags = queue->uring_cmd_issue_flags;
-		} else if (current->io_uring) {
-			/* There are two cases here
-			 * 1) fuse-server side uses multiple threads accessing
-			 *    the ring. We only have stored issue_flags for
-			 *    into the queue for one thread (the first one
-			 *    that submits FUSE_URING_REQ_FETCH)
-			 * 2) IO requests through io-uring, we do not have
-			 *    issue flags at all for these
-			 */
-			send_in_task = true;
-			issue_flags = 0;
-		} else {
-			if (async_req) {
-				/*
-				 * page cache writes might hold an upper
-				 * spinlockl, which conflicts with the io-uring
-				 * mutex
-				 */
-				send_in_task = true;
-				issue_flags = 0;
-			} else {
-				issue_flags = IO_URING_F_UNLOCKED;
-			}
+			send_in_task = false;
 		}
 	}
 	spin_unlock(&queue->lock);
 
-	if (ring_ent != NULL)
-		fuse_uring_send_to_ring(ring_ent, issue_flags, send_in_task);
+	if (ring_ent != NULL) {
+		struct io_uring_cmd *cmd = ring_ent->cmd;
+		struct fuse_uring_cmd_pdu *pdu =
+			(struct fuse_uring_cmd_pdu *)cmd->pdu;
+
+		pdu->ring_ent = ring_ent;
+		io_uring_cmd_complete_in_task(cmd, fuse_uring_send_req_in_task);
+	}
 
 	return 0;
 

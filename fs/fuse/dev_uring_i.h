@@ -57,7 +57,7 @@ struct fuse_ring_ent {
 	 * pointer to kernel request buffer, userspace side has direct access
 	 * to it through the mmaped buffer
 	 */
-	struct fuse_ring_req *rreq;
+	struct fuse_ring_req __user *rreq;
 
 	/* the ring queue that owns the request */
 	struct fuse_ring_queue *queue;
@@ -79,6 +79,9 @@ struct fuse_ring_ent {
 	unsigned int async : 1;
 
 	struct fuse_req *fuse_req; /* when a list request is handled */
+
+	/* struct fuse_ring_req::in_out_arg size*/
+	size_t max_arg_len;
 };
 
 struct fuse_ring_queue {

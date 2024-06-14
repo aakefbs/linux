@@ -778,7 +778,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 			cs->pipebufs++;
 			cs->nr_segs++;
 		}
-	} else if (cs->is_uring) {
+	} else if (0 && cs->is_uring) {
 		if (cs->ring.offset > cs->ring.buf_sz)
 			return -ERANGE;
 		cs->len = cs->ring.buf_sz - cs->ring.offset;
@@ -787,6 +787,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
 		if (err < 0)
 			return err;
+
 		BUG_ON(!err);
 		cs->len = err;
 		cs->offset = off;
@@ -806,14 +807,8 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 		void *pgaddr = NULL;
 		void *buf;
 
-		if (cs->is_uring) {
-			buf = cs->ring.buf + cs->ring.offset;
-			cs->ring.offset += ncpy;
-
-		} else {
-			pgaddr = kmap_local_page(cs->pg);
-			buf = pgaddr + cs->offset;
-		}
+		pgaddr = kmap_local_page(cs->pg);
+		buf = pgaddr + cs->offset;
 
 		if (cs->write)
 			memcpy(buf, *val, ncpy);
@@ -824,6 +819,8 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 			kunmap_local(pgaddr);
 
 		*val += ncpy;
+		if (cs->is_uring)
+			cs->ring.offset += ncpy;
 	}
 	*size -= ncpy;
 	cs->len -= ncpy;
@@ -1067,8 +1064,10 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 	while (size) {
 		if (!cs->len) {
 			int err = fuse_copy_fill(cs);
-			if (err)
+			if (err) {
+				pr_info("%s:%d err=%d\n", __func__, __LINE__, err);
 				return err;
+			}
 		}
 		fuse_copy_do(cs, &val, &size);
 	}
@@ -1110,6 +1109,7 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned int numargs,
 				err = fuse_copy_align(cs);
 		}
 	}
+
 	return err;
 }
 
