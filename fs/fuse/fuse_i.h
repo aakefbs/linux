@@ -275,13 +275,15 @@ struct fuse_file {
 
 /** One input argument of a request */
 struct fuse_in_arg {
-	unsigned size;
+	unsigned int size;
+	unsigned int align:1;
 	const void *value;
 };
 
 /** One output argument of a request */
 struct fuse_arg {
-	unsigned size;
+	unsigned int size;
+	unsigned int align:1;
 	void *value;
 };
 
@@ -859,6 +861,9 @@ struct fuse_conn {
 
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
+
+	/**  Should (write) data be page aligned? */
+	unsigned int align_writes:1;
 
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
