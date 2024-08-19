@@ -1649,7 +1649,7 @@ static int fuse_dir_open(struct inode *inode, struct file *file)
 	if (err)
 		return err;
 
-	err = fuse_do_open(fm, get_node_id(inode), file, true);
+	err = fuse_do_open(fm, get_node_id(inode), file, inode, true);
 	if (!err) {
 		struct fuse_file *ff = file->private_data;
 

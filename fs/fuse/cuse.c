@@ -135,7 +135,7 @@ static int cuse_open(struct inode *inode, struct file *file)
 	 * Generic permission check is already done against the chrdev
 	 * file, proceed to open.
 	 */
-	rc = fuse_do_open(&cc->fm, 0, file, 0);
+	rc = fuse_do_open(&cc->fm, 0, file, inode, 0);
 	if (rc)
 		fuse_conn_put(&cc->fc);
 	return rc;
