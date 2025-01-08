@@ -35,6 +35,8 @@ struct fuse_copy_state {
 	unsigned int is_uring:1;
 	struct {
 		unsigned int copied_sz; /* copied size into the user buffer */
+		struct page **pages;
+		int page_idx;
 	} ring;
 };
 

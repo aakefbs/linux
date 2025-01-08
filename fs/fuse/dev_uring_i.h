@@ -40,7 +40,11 @@ enum fuse_ring_req_state {
 struct fuse_ring_ent {
 	/* userspace buffer */
 	struct fuse_uring_req_header __user *headers;
+	struct page **header_pages;
+	int nr_header_pages;
 	void __user *payload;
+	struct page **payload_pages;
+	int nr_payload_pages;
 
 	/* the ring queue that owns the request */
 	struct fuse_ring_queue *queue;
